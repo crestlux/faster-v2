@@ -49,13 +49,12 @@ def compute_q_with_time(critic_fn, critic_params, observations, actions, time):
 
 @jax.jit
 def _sample_actions_jit(agent, observations):
-    observations = jnp.squeeze(observations)
-    assert observations.ndim == 1, observations.shape
-    observations = observations[None, :]
-
+    # Safely add batch dimension if missing (1D for state, 3D for image)
+    observations = jax.tree_map(lambda x: jnp.expand_dims(x, axis=0) if jnp.asarray(x).ndim in (1, 3) else jnp.asarray(x), observations)
+    observations = jax.device_put(observations)
     actions, rng = agent._sample_filtered_diffusion_candidates(observations, agent.N, agent.target_actor.params)
     actions = actions.reshape(-1, agent.action_dim)
-    obs_rep = jnp.broadcast_to(observations, (actions.shape[0], observations.shape[-1]))
+    obs_rep = observations
     qs = compute_q(agent.target_critic.apply_fn, agent.target_critic.params, obs_rep, actions)
     action = actions[jnp.argmax(qs)]
     rng, _ = jax.random.split(rng)
@@ -298,8 +297,8 @@ class FasterIDQLLearner(Agent):
         actor_def = DDPM(time_preprocess_cls=preprocess_time_cls, cond_encoder_cls=cond_model_cls, reverse_encoder_cls=base_model_cls)
 
         time = jnp.zeros((1, 1))
-        observations = jnp.expand_dims(observations, axis=0)
-        actions = jnp.expand_dims(actions, axis=0)
+        observations = jax.tree_map(lambda x: jnp.expand_dims(jnp.asarray(x), axis=0), observations)
+        actions = jax.tree_map(lambda x: jnp.expand_dims(jnp.asarray(x), axis=0), actions)
         actor_params = actor_def.init(actor_key, observations, actions, time)["params"]
         actor = TrainState.create(apply_fn=actor_def.apply, params=actor_params, tx=optax.adamw(learning_rate=actor_lr))
         target_actor = TrainState.create(
@@ -411,9 +410,8 @@ class FasterIDQLLearner(Agent):
         )
 
     def _sample_diffusion_candidates(self, observations, N: int, actor_params):
-        observations_repeated = jnp.broadcast_to(observations[:, None, :], (observations.shape[0], N, observations.shape[-1])).reshape(
-            -1, observations.shape[-1]
-        )
+        batch_size = jax.tree_util.tree_leaves(observations)[0].shape[0]
+        observations_repeated = observations
         actions, rng = ddim_sampler(
             self.actor.apply_fn,
             actor_params,
@@ -427,16 +425,17 @@ class FasterIDQLLearner(Agent):
             self.M,
             eta=self.ddim_eta,
         )
-        return actions.reshape(observations.shape[0], N, -1), rng
+        return actions.reshape(batch_size, N, -1), rng
 
     def _sample_filter_seed_candidates(self, observations, N: int, rng):
+        batch_size = jax.tree_util.tree_leaves(observations)[0].shape[0]
         rng, seed_key = jax.random.split(rng)
-        seed_actions = jax.random.normal(seed_key, (observations.shape[0] * N, self.action_dim))
-        return seed_actions.reshape(observations.shape[0], N, -1), rng
+        seed_actions = jax.random.normal(seed_key, (batch_size * N, self.action_dim))
+        return seed_actions.reshape(batch_size, N, -1), rng
 
     def _select_filter_candidates(self, observations, seed_actions, keep_count: int, temperature: float, rng):
         batch_size, sample_count = seed_actions.shape[:2]
-        obs_rep = jnp.broadcast_to(observations[:, None, :], (batch_size, sample_count, observations.shape[-1]))
+        obs_rep = jax.tree_map(lambda x: jnp.broadcast_to(x[:, None, ...], (batch_size, sample_count, *x.shape[1:])), observations)
         if keep_count >= sample_count:
             return obs_rep, seed_actions, rng
 
@@ -445,7 +444,7 @@ class FasterIDQLLearner(Agent):
         filter_scores = compute_q_with_time(
             self.target_filter_critic.apply_fn,
             self.target_filter_critic.params,
-            obs_rep.reshape(-1, observations.shape[-1]),
+            jax.tree_map(lambda x: x.reshape(-1, *x.shape[2:]), obs_rep),
             seed_actions.reshape(-1, self.action_dim),
             time,
         ).reshape(batch_size, sample_count)
@@ -458,7 +457,7 @@ class FasterIDQLLearner(Agent):
         observations = batch["observations"]
         seed_actions, rng = self._sample_filter_seed_candidates(observations, self.train_N, rng)
         filter_observations, filter_actions, rng = self._select_filter_candidates(observations, seed_actions, 1, 0.0, rng)
-        filter_observations = filter_observations.reshape(-1, observations.shape[-1])
+        filter_observations = jax.tree_map(lambda x: x.reshape(-1, *x.shape[2:]), filter_observations)
         filter_actions = filter_actions.reshape(-1, self.action_dim)
         outer_critic_actions, rng = diffusion_sampler_from_x(
             self.actor.apply_fn,
@@ -495,7 +494,7 @@ class FasterIDQLLearner(Agent):
             self.T,
             rng,
             self.action_dim,
-            obs_rep.reshape(-1, observations.shape[-1]),
+            jax.tree_map(lambda x: x.reshape(-1, *x.shape[2:]), obs_rep),
             seed_actions.reshape(-1, self.action_dim),
             self.alphas,
             self.alpha_hats,
@@ -505,7 +504,7 @@ class FasterIDQLLearner(Agent):
             use_ddim=True,
             eta=self.ddim_eta,
         )
-        return final_actions.reshape(observations.shape[0], seed_actions.shape[1], -1), rng
+        return final_actions.reshape(batch_size, seed_actions.shape[1], -1), rng
 
     def eval_actions(self, observations):
         action, rng = _sample_actions_jit(self, observations)

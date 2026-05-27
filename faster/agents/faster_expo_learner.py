@@ -25,6 +25,7 @@ from faster.networks import (
     FourierFeatures,
     MLPResNetV2,
     StateActionValue,
+    StateActionEncoder,
     cosine_beta_schedule,
     ddim_sampler,
     subsample_ensemble,
@@ -45,26 +46,23 @@ def compute_q(critic_fn, critic_params, observations, actions):
 
 
 @partial(jax.jit, static_argnames=("apply_fn",))
-def _sample_actions(rng, apply_fn, params, observations: np.ndarray) -> np.ndarray:
+def _sample_actions(rng, apply_fn, params, *args) -> np.ndarray:
     key, rng = jax.random.split(rng)
-    dist = apply_fn({"params": params}, observations)
+    dist = apply_fn({"params": params}, *args)
     return dist.sample(seed=key), rng
 
 
 @jax.jit
 def _sample_actions_jit(agent, observations):
     rng = agent.rng
-    observations = jnp.squeeze(observations)
-    assert observations.ndim == 1, observations.shape
-    observations = jnp.expand_dims(observations, axis=0)
+    observations = jax.tree_map(lambda x: jnp.squeeze(x), observations)
+    observations = jax.tree_map(lambda x: jnp.expand_dims(x, axis=0) if x.ndim == 1 or x.ndim == 3 else x, observations)
 
     actor_params = agent.target_actor.params
     if agent.filter_enabled and agent.filter_at_eval:
         actions, _, rng = agent._sample_candidates(rng, observations, agent.N, actor_params, agent.filter_temperature_train)
     else:
-        observations_repeated = jnp.broadcast_to(
-            observations[:, None, :], (observations.shape[0], agent.N, observations.shape[-1])
-        ).reshape(-1, observations.shape[-1])
+        observations_repeated = observations
         actions, rng = ddim_sampler(
             agent.actor.apply_fn,
             actor_params,
@@ -85,22 +83,17 @@ def _sample_actions_jit(agent, observations):
     if diffusion_actions.shape[0] > 1 or agent.ne_samples > 0:
         key, rng = jax.random.split(rng)
         target_params = subsample_ensemble(key, agent.target_critic.params, agent.num_min_qs, agent.num_qs)
-        obs_rep = jnp.broadcast_to(
-            observations[:, None, :], (observations.shape[0], diffusion_actions.shape[0], observations.shape[-1])
-        ).reshape(-1, observations.shape[-1])
+        obs_rep = observations
         all_actions = diffusion_actions
 
         if agent.ne_samples > 0:
             key, rng = jax.random.split(rng)
             d_actions = diffusion_actions[: agent.ne_samples]
-            r_obs = jnp.broadcast_to(observations[:, None, :], (observations.shape[0], agent.ne_samples, observations.shape[-1])).reshape(
-                -1, observations.shape[-1]
-            )
-            r_in = jnp.concatenate([r_obs, d_actions], axis=1)
-            r_samples, rng = _sample_actions(key, agent.edit_actor.apply_fn, agent.edit_actor.params, r_in)
+            r_obs = observations
+            r_samples, rng = _sample_actions(key, agent.edit_actor.apply_fn, agent.edit_actor.params, r_obs, d_actions)
             r_samples = agent._apply_residual_action_mask(r_samples * agent.r_action_scale) + d_actions
             r_samples = jnp.clip(r_samples, -1.0, 1.0)
-            obs_rep = jnp.concatenate([obs_rep, r_obs], axis=0)
+            obs_rep = jax.tree_map(lambda x, y: jnp.concatenate([x, y], axis=0), obs_rep, r_obs)
             all_actions = jnp.concatenate([all_actions, r_samples], axis=0)
 
         qs = compute_q(agent.target_critic.apply_fn, target_params, obs_rep, all_actions)
@@ -170,9 +163,11 @@ def _gather_axis1(x, idx):
     if x is None:
         return None
     idx = jnp.asarray(idx)
-    batch = jnp.arange(x.shape[0]).reshape((x.shape[0],) + (1,) * (idx.ndim - 1))
-    batch = jnp.broadcast_to(batch, idx.shape)
-    return x[batch, idx]
+    def _gather_fn(arr):
+        batch = jnp.arange(arr.shape[0]).reshape((arr.shape[0],) + (1,) * (idx.ndim - 1))
+        batch = jnp.broadcast_to(batch, idx.shape)
+        return arr[batch, idx]
+    return jax.tree_map(_gather_fn, x)
 
 
 default_init = nn.initializers.xavier_uniform
@@ -184,10 +179,19 @@ class DenoisingStateActionValue(nn.Module):
     time_preprocess_cls: nn.Module
 
     @nn.compact
-    def __call__(self, observations: jnp.ndarray, actions: jnp.ndarray, time: jnp.ndarray, training: bool = False):
+    def __call__(self, observations, actions: jnp.ndarray, time: jnp.ndarray, training: bool = False):
         t_ff = self.time_preprocess_cls()(time)
         cond = self.cond_encoder_cls()(t_ff, training=training)
-        inputs = jnp.concatenate([observations, actions, cond], axis=-1)
+        
+        if isinstance(observations, dict) and "image" in observations:
+            from faster.networks.resnet import ImageStateEncoder, get_resnet18
+            obs_encoded = ImageStateEncoder(encoder_cls=get_resnet18)(observations, training=training)
+        elif isinstance(observations, dict):
+            obs_encoded = observations["state"]
+        else:
+            obs_encoded = observations
+            
+        inputs = jnp.concatenate([obs_encoded, actions, cond], axis=-1)
         outputs = self.base_cls()(inputs, training=training)
         value = nn.Dense(1, kernel_init=default_init())(outputs)
         return jnp.squeeze(value, -1)
@@ -214,15 +218,15 @@ def ddim_sampler_hidden_filter(
     training: bool = False,
     init_noise=None,
 ):
-    batch_size = observations.shape[0]
-    obs = jnp.broadcast_to(observations[:, None, :], (batch_size, N, observations.shape[-1]))
+    batch_size = jax.tree_util.tree_leaves(observations)[0].shape[0]
+    obs = jax.tree_map(lambda x: jnp.broadcast_to(x[:, None, ...], (batch_size, N, *x.shape[1:])), observations)
     rng, init_key, noise_key = jax.random.split(rng, 3)
     x = jax.random.normal(init_key, (batch_size, N, act_dim)) if init_noise is None else init_noise
     temp = jnp.asarray(filter_temperature, dtype=jnp.float32)
 
     def step(x_, obs_, t_):
         x_flat = x_.reshape(-1, act_dim)
-        obs_flat = obs_.reshape(-1, obs_.shape[-1])
+        obs_flat = jax.tree_map(lambda x: x.reshape(-1, *x.shape[2:]), obs_)
         t_ = jnp.asarray(t_, dtype=jnp.int32)
         time = jnp.full((x_flat.shape[0], 1), t_)
         eps_pred = actor_apply_fn({"params": actor_params}, obs_flat, x_flat, time, training=training)
@@ -270,7 +274,7 @@ def ddim_sampler_hidden_filter(
         if hidden_apply_fn is None or hidden_params is None:
             raise ValueError("hidden_apply_fn and hidden_params are required when filtering more than one candidate.")
         x_flat = x_eval.reshape(-1, act_dim)
-        obs_flat = obs.reshape(-1, obs.shape[-1])
+        obs_flat = jax.tree_map(lambda x: x.reshape(-1, *x.shape[2:]), obs)
         time = jnp.full((x_flat.shape[0], 1), T, dtype=jnp.int32)
         q_values_sel = hidden_apply_fn({"params": hidden_params}, obs_flat, x_flat, time)
         q_sel = q_values_sel.min(axis=0).reshape(batch_size, -1)
@@ -435,8 +439,8 @@ class FasterEXPOLearner(Agent):
         actor_def = DDPM(time_preprocess_cls=preprocess_time_cls, cond_encoder_cls=cond_model_cls, reverse_encoder_cls=base_model_cls)
 
         time = jnp.zeros((1, 1))
-        observations = jnp.expand_dims(jnp.asarray(observations), axis=0)
-        actions = jnp.expand_dims(jnp.asarray(actions), axis=0)
+        observations = jax.tree_map(lambda x: jnp.expand_dims(jnp.asarray(x), axis=0), observations)
+        actions = jax.tree_map(lambda x: jnp.expand_dims(jnp.asarray(x), axis=0), actions)
         actor_params = actor_def.init(actor_key, observations, actions, time)["params"]
         actor = TrainState.create(apply_fn=actor_def.apply, params=actor_params, tx=optax.adamw(learning_rate=actor_lr))
         target_actor = TrainState.create(
@@ -456,9 +460,9 @@ class FasterEXPOLearner(Agent):
         alpha_hat = jnp.array([jnp.prod(alphas[: i + 1]) for i in range(T)])
 
         edit_actor_base_cls = partial(MLP, hidden_dims=hidden_dims, dropout_rate=actor_drop, activate_final=True, use_pnorm=use_pnorm)
+        edit_actor_base_cls = partial(StateActionEncoder, base_cls=edit_actor_base_cls)
         edit_actor_def = TanhNormal(edit_actor_base_cls, action_dim)
-        edit_observations = jnp.concatenate([observations, jnp.ones((1, action_dim))], axis=1)
-        edit_actor_params = edit_actor_def.init(actor_key, edit_observations)["params"]
+        edit_actor_params = edit_actor_def.init(actor_key, observations, jnp.ones((1, action_dim)))["params"]
         edit_actor = TrainState.create(apply_fn=edit_actor_def.apply, params=edit_actor_params, tx=optax.adam(learning_rate=actor_lr))
 
         def make_critic_base_cls(critic_hidden_dims_):
@@ -561,15 +565,12 @@ class FasterEXPOLearner(Agent):
         )
 
     def _sample_candidates(self, rng, observations, N, actor_params, filter_temperature):
-        observations = jax.device_put(jnp.asarray(observations))
-        if observations.ndim == 1:
-            observations = observations[None, :]
-        batch_size = observations.shape[0]
+        observations = jax.tree_map(lambda x: jax.device_put(jnp.asarray(x)), observations)
+        observatiogns = jax.tree_map(lambda x: x[None, :] if x.ndim == 1 else x, observations)
+        batch_size = jax.tree_util.tree_leaves(observations)[0].shape[0]
 
         if not self.filter_enabled:
-            observations_repeated = jnp.broadcast_to(observations[:, None, :], (batch_size, N, observations.shape[-1])).reshape(
-                -1, observations.shape[-1]
-            )
+            observations_repeated = observations
             actions_flat, rng = ddim_sampler(
                 self.actor.apply_fn,
                 actor_params,
@@ -635,22 +636,17 @@ class FasterEXPOLearner(Agent):
         return residual_actions * mask
 
     def _select_best_actions(self, rng, observations, actions, target_params):
-        batch_size = observations.shape[0]
+        batch_size = jax.tree_util.tree_leaves(observations)[0].shape[0]
         num_candidates = actions.shape[1]
         total_candidates = num_candidates + self.ne_samples_train
-        observations_repeated = jnp.broadcast_to(observations[:, None, :], (batch_size, total_candidates, observations.shape[-1])).reshape(
-            -1, observations.shape[-1]
-        )
+        observations_repeated = observations
         actions_all = actions
 
         if self.ne_samples_train > 0:
             key, rng = jax.random.split(rng)
-            r_observations = jnp.broadcast_to(
-                observations[:, None, :], (batch_size, self.ne_samples_train, observations.shape[-1])
-            ).reshape(-1, observations.shape[-1])
+            r_observations = observations
             d_actions = actions[:, : self.ne_samples_train].reshape(-1, actions.shape[-1])
-            r_observations = jnp.concatenate([r_observations, d_actions], axis=1)
-            r_samples, rng = _sample_actions(key, self.edit_actor.apply_fn, self.edit_actor.params, r_observations)
+            r_samples, rng = _sample_actions(key, self.edit_actor.apply_fn, self.edit_actor.params, r_observations, d_actions)
             r_samples = self._apply_residual_action_mask(r_samples * self.r_action_scale) + d_actions
             r_samples = jnp.clip(r_samples, -1.0, 1.0)
             r_samples = r_samples.reshape(batch_size, self.ne_samples_train, -1)
@@ -673,18 +669,16 @@ class FasterEXPOLearner(Agent):
 
     def eval_actions(self, observations):
         rng = self.rng
-        observations = jnp.squeeze(observations)
-        assert len(observations.shape) == 1
+        
+        # Safely add batch dimension if missing (1D for state, 3D for image)
+        observations = jax.tree_map(lambda x: jnp.expand_dims(x, axis=0) if jnp.asarray(x).ndim in (1, 3) else jnp.asarray(x), observations)
         observations = jax.device_put(observations)
-        observations = jnp.expand_dims(observations, axis=0)
 
         actor_params = self.target_actor.params
         if self.filter_enabled and self.filter_at_eval:
             actions, _, rng = self._sample_candidates(rng, observations, self.N, actor_params, self.filter_temperature_eval)
         else:
-            observations_repeated = jnp.broadcast_to(
-                observations[:, None, :], (observations.shape[0], self.N, observations.shape[-1])
-            ).reshape(-1, observations.shape[-1])
+            observations_repeated = observations
             actions, rng = ddim_sampler(
                 self.actor.apply_fn,
                 actor_params,
@@ -705,22 +699,17 @@ class FasterEXPOLearner(Agent):
         if diffusion_actions.shape[0] > 1 or self.ne_samples > 0:
             key, rng = jax.random.split(rng)
             target_params = subsample_ensemble(key, self.target_critic.params, self.num_min_qs, self.num_qs)
-            obs_rep = jnp.broadcast_to(
-                observations[:, None, :], (observations.shape[0], diffusion_actions.shape[0], observations.shape[-1])
-            ).reshape(-1, observations.shape[-1])
+            obs_rep = observations
             all_actions = diffusion_actions
 
             if self.ne_samples > 0:
                 key, rng = jax.random.split(rng)
                 d_actions = diffusion_actions[: self.ne_samples]
-                r_obs = jnp.broadcast_to(
-                    observations[:, None, :], (observations.shape[0], self.ne_samples, observations.shape[-1])
-                ).reshape(-1, observations.shape[-1])
-                r_in = jnp.concatenate([r_obs, d_actions], axis=1)
-                r_samples, rng = _sample_actions(key, self.edit_actor.apply_fn, self.edit_actor.params, r_in)
+                r_obs = observations
+                r_samples, rng = _sample_actions(key, self.edit_actor.apply_fn, self.edit_actor.params, r_obs, d_actions)
                 r_samples = self._apply_residual_action_mask(r_samples * self.r_action_scale) + d_actions
                 r_samples = jnp.clip(r_samples, -1.0, 1.0)
-                obs_rep = jnp.concatenate([obs_rep, r_obs], axis=0)
+                obs_rep = jax.tree_map(lambda x, y: jnp.concatenate([x, y], axis=0), obs_rep, r_obs)
                 all_actions = jnp.concatenate([all_actions, r_samples], axis=0)
 
             qs = compute_q(self.target_critic.apply_fn, target_params, obs_rep, all_actions)
@@ -743,8 +732,7 @@ class FasterEXPOLearner(Agent):
         dropout_key, rng = jax.random.split(rng)
 
         def edit_actor_loss_fn(actor_params):
-            edit_observations = jnp.concatenate([batch["observations"], batch["actions"]], axis=1)
-            dist = self.edit_actor.apply_fn({"params": actor_params}, edit_observations, training=True, rngs={"dropout": dropout_key})
+            dist = self.edit_actor.apply_fn({"params": actor_params}, batch["observations"], batch["actions"], training=True, rngs={"dropout": dropout_key})
             actions = dist.sample(seed=key)
             log_probs = dist.log_prob(actions)
             actions = self._apply_residual_action_mask(actions * self.r_action_scale)
@@ -826,8 +814,9 @@ class FasterEXPOLearner(Agent):
         target_filter_critic = self.target_filter_critic
         if self.filter_enabled and stored and filter_critic is not None and target_filter_critic is not None:
             k_final = next_actions_candidates.shape[1]
-            obs_rep = jnp.broadcast_to(next_obs[:, None, :], (next_obs.shape[0], k_final, next_obs.shape[-1])).reshape(
-                -1, next_obs.shape[-1]
+            obs_rep = jax.tree_map(
+                lambda x: jnp.broadcast_to(x[:, None, ...], (x.shape[0], k_final, *x.shape[1:])).reshape(-1, *x.shape[1:]),
+                next_obs
             )
             a0_flat = next_actions_candidates.reshape(-1, next_actions_candidates.shape[-1])
             q0 = compute_q(self.target_critic.apply_fn, target_params, obs_rep, a0_flat).reshape(-1, k_final)
@@ -837,8 +826,9 @@ class FasterEXPOLearner(Agent):
             stored_actions = jnp.stack(stored, axis=0)
             a_stacked = stored_actions.reshape(-1, stored_actions.shape[-1])
             q0_flat = q0.reshape(-1)
-            obs_stacked = jnp.broadcast_to(obs_rep[None, :, :], (num_stages, obs_rep.shape[0], obs_rep.shape[1])).reshape(
-                -1, obs_rep.shape[-1]
+            obs_stacked = jax.tree_map(
+                lambda x: jnp.broadcast_to(x[None, ...], (num_stages, *x.shape)).reshape(-1, *x.shape[1:]),
+                obs_rep
             )
             t_stages = jnp.asarray((self.T,), dtype=jnp.int32)
             q_targets = jnp.broadcast_to(q0_flat[None, :], (num_stages, q0_flat.shape[0]))
@@ -883,8 +873,8 @@ class FasterEXPOLearner(Agent):
     @partial(jax.jit, static_argnames=("utd_ratio", "pretrain_q", "pretrain_r"))
     def update_offline(self, batch: DatasetDict, utd_ratio: int, pretrain_q: bool, pretrain_r: bool):
         assert utd_ratio > 0
-        assert batch["observations"].shape[0] % utd_ratio == 0
-        mini_batch_size = batch["observations"].shape[0] // utd_ratio
+        assert jax.tree_util.tree_leaves(batch["observations"])[0].shape[0] % utd_ratio == 0
+        mini_batch_size = jax.tree_util.tree_leaves(batch["observations"])[0].shape[0] // utd_ratio
 
         def get_mini_batch(i):
             start = i * mini_batch_size
@@ -918,8 +908,8 @@ class FasterEXPOLearner(Agent):
     @partial(jax.jit, static_argnames="utd_ratio")
     def update_separate(self, batch: DatasetDict, actor_batch: DatasetDict, utd_ratio: int):
         assert utd_ratio > 0
-        assert batch["observations"].shape[0] % utd_ratio == 0
-        mini_batch_size = batch["observations"].shape[0] // utd_ratio
+        assert jax.tree_util.tree_leaves(batch["observations"])[0].shape[0] % utd_ratio == 0
+        mini_batch_size = jax.tree_util.tree_leaves(batch["observations"])[0].shape[0] // utd_ratio
 
         def get_mini_batch(i):
             start = i * mini_batch_size
@@ -949,8 +939,8 @@ class FasterEXPOLearner(Agent):
     @partial(jax.jit, static_argnames="utd_ratio")
     def update(self, batch: DatasetDict, utd_ratio: int):
         assert utd_ratio > 0
-        assert batch["observations"].shape[0] % utd_ratio == 0
-        mini_batch_size = batch["observations"].shape[0] // utd_ratio
+        assert jax.tree_util.tree_leaves(batch["observations"])[0].shape[0] % utd_ratio == 0
+        mini_batch_size = jax.tree_util.tree_leaves(batch["observations"])[0].shape[0] // utd_ratio
 
         def get_mini_batch(i):
             start = i * mini_batch_size

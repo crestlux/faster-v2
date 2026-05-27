@@ -47,9 +47,9 @@ def compute_q(critic_fn, critic_params, observations, actions):
 @jax.jit
 def _sample_actions_jit(agent, observations):
     rng = agent.rng
-    observations = jnp.squeeze(observations)
-    assert observations.ndim == 1, observations.shape
-    observations = jnp.expand_dims(observations, axis=0).repeat(agent.N, axis=0)
+    # Safely add batch dimension if missing (1D for state, 3D for image)
+    observations = jax.tree_map(lambda x: jnp.expand_dims(x, axis=0) if jnp.asarray(x).ndim in (1, 3) else jnp.asarray(x), observations)
+    observations = jax.tree_map(lambda x: x.repeat(agent.N, axis=0), observations)
 
     actor_params = agent.target_actor.params
     if agent.deterministic_ddim_eta0:
@@ -217,8 +217,8 @@ class IDQLLearner(Agent):
         actor_def = DDPM(time_preprocess_cls=preprocess_time_cls, cond_encoder_cls=cond_model_cls, reverse_encoder_cls=base_model_cls)
 
         time = jnp.zeros((1, 1))
-        observations = jnp.expand_dims(observations, axis=0)
-        actions = jnp.expand_dims(actions, axis=0)
+        observations = jax.tree_map(lambda x: jnp.expand_dims(jnp.asarray(x), axis=0), observations)
+        actions = jax.tree_map(lambda x: jnp.expand_dims(jnp.asarray(x), axis=0), actions)
         actor_params = actor_def.init(actor_key, observations, actions, time)["params"]
 
         actor = TrainState.create(apply_fn=actor_def.apply, params=actor_params, tx=optax.adamw(learning_rate=actor_lr))

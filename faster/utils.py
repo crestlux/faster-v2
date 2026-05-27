@@ -6,15 +6,15 @@ import numpy as np
 from robomimic.utils.dataset import SequenceDataset
 
 import wandb
-from faster.data.robomimic_datasets import OBS_KEYS, process_robomimic_dataset
+from faster.data.robomimic_datasets import LOW_DIM_OBS_KEYS, IMAGE_OBS_KEYS, process_robomimic_dataset
 from faster.evaluation import evaluate_robo
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def robomimic_datasets_root(default_root):
-    if "ROBOMIMIC_DATASETS_PATH" in os.environ:
-        return Path(os.environ["ROBOMIMIC_DATASETS_PATH"])
+    # if "ROBOMIMIC_DATASETS_PATH" in os.environ:
+    #     return Path(os.environ["ROBOMIMIC_DATASETS_PATH"])
     fallback_root = _REPO_ROOT / "datasets" / "robomimic"
     if fallback_root.is_dir():
         return fallback_root
@@ -101,7 +101,7 @@ def _batch_size(tree):
 def _combine_with_indices(one_tree, other_tree, shuffle_indices):
     combined = {}
     for k, v in one_tree.items():
-        if isinstance(v, dict):
+        if isinstance(v, dict) or type(v).__name__ == 'FrozenDict':
             combined[k] = _combine_with_indices(v, other_tree[k], shuffle_indices)
         else:
             other_v = other_tree[k]
@@ -120,7 +120,7 @@ def combine(one_dict, other_dict, rng):
 def combine_half(one_dict, other_dict, rng):
     combined = {}
     for k, v in one_dict.items():
-        if isinstance(v, dict):
+        if isinstance(v, dict) or type(v).__name__ == 'FrozenDict':
             combined[k] = combine_half(v, other_dict[k], rng)
         else:
             other_v = other_dict[k]
@@ -142,15 +142,19 @@ def _sample_action(agent, observation):
     return np.asarray(action), agent
 
 
-def _load_robomimic_dataset(dataset_path):
+def _load_robomimic_dataset(dataset_path, use_image_obs=False):
+    obs_keys = list(LOW_DIM_OBS_KEYS)
+    if use_image_obs:
+        obs_keys.extend(IMAGE_OBS_KEYS)
+        
     seq_dataset = SequenceDataset(
         hdf5_path=str(dataset_path),
-        obs_keys=OBS_KEYS,
+        obs_keys=tuple(obs_keys),
         dataset_keys=("actions", "rewards", "dones"),
         hdf5_cache_mode="all",
         load_next_obs=True,
     )
-    return process_robomimic_dataset(seq_dataset)
+    return process_robomimic_dataset(seq_dataset, use_image_obs=use_image_obs)
 
 
 def _build_source_code_include_fn(repo_root):

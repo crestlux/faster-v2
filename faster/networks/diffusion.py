@@ -1,3 +1,4 @@
+from faster.networks.resnet import ImageStateEncoder, get_resnet18
 from functools import partial
 from typing import Callable, Optional, Sequence, Type
 
@@ -50,12 +51,33 @@ class DDPM(nn.Module):
     cond_encoder_cls: Type[nn.Module]
     reverse_encoder_cls: Type[nn.Module]
     time_preprocess_cls: Type[nn.Module]
+    obs_encoder_cls: Optional[Type[nn.Module]] = None
 
     @nn.compact
-    def __call__(self, s: jnp.ndarray, a: jnp.ndarray, time: jnp.ndarray, training: bool = False):
+    def __call__(self, s, a: jnp.ndarray, time: jnp.ndarray, training: bool = False):
         t_ff = self.time_preprocess_cls()(time)
         cond = self.cond_encoder_cls()(t_ff, training=training)
-        reverse_input = jnp.concatenate([a, s, cond], axis=-1)
+        
+        if self.obs_encoder_cls is not None:
+            s_encoded = self.obs_encoder_cls()(s, training=training)
+        elif isinstance(s, dict) and "image" in s:
+            s_encoded = ImageStateEncoder(encoder_cls=get_resnet18)(s, training=training)
+        elif isinstance(s, dict):
+            s_encoded = s["state"]
+        else:
+            s_encoded = s
+            
+        if a.shape[0] != s_encoded.shape[0]:
+            if a.shape[0] % s_encoded.shape[0] == 0:
+                repeat_factor = a.shape[0] // s_encoded.shape[0]
+                s_encoded = jnp.repeat(s_encoded, repeat_factor, axis=0)
+
+        if a.shape[0] != cond.shape[0]:
+            if a.shape[0] % cond.shape[0] == 0:
+                repeat_factor = a.shape[0] // cond.shape[0]
+                cond = jnp.repeat(cond, repeat_factor, axis=0)
+                
+        reverse_input = jnp.concatenate([a, s_encoded, cond], axis=-1)
 
         return self.reverse_encoder_cls()(reverse_input, training=training)
 
@@ -76,7 +98,7 @@ def ddpm_train_sampler(
     clip_sampler,
     training=False,
 ):
-    batch_size = observations.shape[0]
+    batch_size = jax.tree_util.tree_leaves(observations)[0].shape[0]
 
     def fn(input_tuple, time):
         current_x, rng = input_tuple
@@ -89,7 +111,7 @@ def ddpm_train_sampler(
         current_x = alpha_1 * (current_x - alpha_2 * eps_pred)
 
         rng, key = jax.random.split(rng, 2)
-        z = jax.random.normal(key, shape=(observations.shape[0], current_x.shape[1]))
+        z = jax.random.normal(key, shape=(batch_size, current_x.shape[1]))
         z_scaled = sample_temperature * z
         current_x = current_x + (time > 0) * (jnp.sqrt(betas[time]) * z_scaled)
 
@@ -133,7 +155,7 @@ def ddpm_hidden_train_sampler(
     sar_N,
     training=False,
 ):
-    total_batch_size = observations.shape[0]  # batch_size * N
+    total_batch_size = jax.tree_util.tree_leaves(observations)[0].shape[0]  # batch_size * N
     batch_size = total_batch_size // N
 
     # Denoise first step
@@ -165,7 +187,7 @@ def ddpm_hidden_train_sampler(
     critic_values_reshaped = critic_values.min(axis=0).reshape(batch_size, N)
     current_x_reshaped = current_x.reshape(batch_size, N, act_dim)
     first_step_hidden_reshaped = first_step_hidden.reshape(batch_size, N, act_dim)
-    observations_reshaped = observations.reshape(batch_size, N, -1)
+    observations_reshaped = jax.tree_map(lambda x: x.reshape(batch_size, N, *x.shape[1:]), observations)
 
     # Get top M indices
     _, top_m_indices = jax.lax.top_k(critic_values_reshaped, sar_N)
@@ -173,7 +195,7 @@ def ddpm_hidden_train_sampler(
 
     # Filter to top M
     filtered_x = current_x_reshaped[batch_indices, top_m_indices].reshape(batch_size * sar_N, act_dim)
-    filtered_observations = observations_reshaped[batch_indices, top_m_indices].reshape(batch_size * sar_N, -1)
+    filtered_observations = jax.tree_map(lambda x: x[batch_indices, top_m_indices].reshape(batch_size * sar_N, *x.shape[2:]), observations_reshaped)
     filtered_first_step = first_step_hidden_reshaped[batch_indices, top_m_indices].reshape(batch_size * sar_N, act_dim)
     filtered_critic_values = critic_values_reshaped[batch_indices, top_m_indices].reshape(batch_size * sar_N)
 
@@ -225,7 +247,7 @@ def ddpm_sampler(
     clip_sampler,
     training=False,
 ):
-    batch_size = observations.shape[0]
+    batch_size = jax.tree_util.tree_leaves(observations)[0].shape[0]
     init_key, rng = jax.random.split(rng)
     noise_key, rng = jax.random.split(rng)
 
@@ -275,7 +297,7 @@ def ddim_sampler(
     *,
     eta: float = 0.0,
 ):
-    batch_size = observations.shape[0]
+    batch_size = jax.tree_util.tree_leaves(observations)[0].shape[0]
     init_key, rng = jax.random.split(rng)
     noise_key, rng = jax.random.split(rng)
 

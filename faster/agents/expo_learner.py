@@ -178,8 +178,8 @@ class EXPOLearner(Agent):
         actor_def = DDPM(time_preprocess_cls=preprocess_time_cls, cond_encoder_cls=cond_model_cls, reverse_encoder_cls=base_model_cls)
 
         time = jnp.zeros((1, 1))
-        observations = jnp.expand_dims(observations, axis=0)
-        actions = jnp.expand_dims(actions, axis=0)
+        observations = jax.tree_map(lambda x: jnp.expand_dims(jnp.asarray(x), axis=0), observations)
+        actions = jax.tree_map(lambda x: jnp.expand_dims(jnp.asarray(x), axis=0), actions)
         actor_params = actor_def.init(actor_key, observations, actions, time)["params"]
 
         actor = TrainState.create(apply_fn=actor_def.apply, params=actor_params, tx=optax.adamw(learning_rate=actor_lr))
@@ -270,10 +270,11 @@ class EXPOLearner(Agent):
 
     def eval_actions(self, observations):
         rng = self.rng
-        observations = jnp.squeeze(observations)
-        assert len(observations.shape) == 1
+        
+        # Safely add batch dimension if missing (1D for state, 3D for image)
+        observations = jax.tree_map(lambda x: jnp.expand_dims(x, axis=0) if jnp.asarray(x).ndim in (1, 3) else jnp.asarray(x), observations)
         observations = jax.device_put(observations)
-        observations = jnp.expand_dims(observations, axis=0).repeat(self.N, axis=0)
+        observations = jax.device_put(observations).repeat(self.N, axis=0)
 
         actor_params = self.target_actor.params
         actions, rng = ddpm_sampler(
@@ -304,7 +305,7 @@ class EXPOLearner(Agent):
                     [observations, jnp.expand_dims(observations[0], axis=0).repeat(self.ne_samples, axis=0)], axis=0
                 )
 
-                r_observations = jnp.repeat(jnp.expand_dims(observations[0], axis=0), self.ne_samples, axis=0)
+                r_observations = jnp.expand_dims(observations[0], axis=0)
                 d_actions = diffusion_actions.copy()[: self.ne_samples]
                 r_observations = jnp.concatenate([r_observations, d_actions], axis=1)
                 r_samples, rng = _sample_actions(key, self.edit_actor.apply_fn, self.edit_actor.params, r_observations)
@@ -335,10 +336,10 @@ class EXPOLearner(Agent):
         observations = jnp.squeeze(observations)
         observations = jax.device_put(observations)
 
-        batch_size = observations.shape[0]
+        batch_size = jax.tree_util.tree_leaves(observations)[0].shape[0]
 
         # Repeat each observation N times: (batch_size, obs_dim) -> (batch_size * N, obs_dim)
-        observations_repeated = jnp.repeat(observations, self.train_N, axis=0)
+        observations_repeated = observations
 
         actor_params = self.actor.params
         actions_flat, rng = ddpm_train_sampler(
@@ -359,11 +360,11 @@ class EXPOLearner(Agent):
         # Reshape actions from (batch_size * N, action_dim) to (batch_size, N, action_dim)
         actions = actions_flat.reshape(batch_size, self.train_N, -1)
 
-        observations_repeated = jnp.repeat(observations, self.train_N + self.ne_samples_train, axis=0)
+        observations_repeated = observations
 
         if self.ne_samples_train > 0:
             key, rng = jax.random.split(rng, 2)
-            r_observations = jnp.repeat(observations, self.ne_samples_train, axis=0)  # (batch_size * ne_samples_train, obs_dim) repeats
+            r_observations = observations
             d_actions = actions.copy()[:, : self.ne_samples_train].reshape(-1, actions.shape[-1])
             r_observations = jnp.concatenate([r_observations, d_actions], axis=1)  # self.ne_samples_train actions for each observation
             r_samples, rng = _sample_actions(key, self.edit_actor.apply_fn, self.edit_actor.params, r_observations)
@@ -432,10 +433,9 @@ class EXPOLearner(Agent):
 
     def sample_actions(self, observations):
         rng = self.rng
-        observations = jnp.squeeze(observations)
-        assert len(observations.shape) == 1
+        observations = jax.tree_map(lambda x: jnp.squeeze(x), observations)
+        pass # observations = observations
         observations = jax.device_put(observations)
-        observations = jnp.expand_dims(observations, axis=0).repeat(self.N, axis=0)
 
         actor_params = self.target_actor.params
         actions, rng = ddpm_sampler(
@@ -466,7 +466,7 @@ class EXPOLearner(Agent):
                     [observations, jnp.expand_dims(observations[0], axis=0).repeat(self.ne_samples, axis=0)], axis=0
                 )
 
-                r_observations = jnp.repeat(jnp.expand_dims(observations[0], axis=0), self.ne_samples, axis=0)
+                r_observations = jnp.expand_dims(observations[0], axis=0)
                 d_actions = diffusion_actions.copy()[: self.ne_samples]
                 r_observations = jnp.concatenate([r_observations, d_actions], axis=1)
                 r_samples, rng = _sample_actions(key, self.edit_actor.apply_fn, self.edit_actor.params, r_observations)

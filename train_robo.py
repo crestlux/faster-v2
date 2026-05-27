@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+import jax
 import inspect
 import json
 import os
@@ -18,6 +19,7 @@ import wandb
 from faster.agents import EXPOLearner, FasterEXPOLearner, FasterIDQLLearner, IDQLLearner
 from faster.data import RoboReplayBuffer
 from faster.data.robomimic_datasets import ENV_TO_HORIZON_MAP, RoboD4RLDataset, get_robomimic_env
+from faster.networks.evaluation_wandb_video import get_video_robomimic_env, maybe_evaluate_robo_with_wandb_video
 from faster.param_utils import print_agent_param_summary
 from faster.train_robo_env_utils import _resolve_robomimic_dataset_path
 from faster.utils import (
@@ -29,7 +31,6 @@ from faster.utils import (
     _sample_action,
     combine,
     combine_half,
-    maybe_evaluate_robo,
     robomimic_datasets_root,
 )
 
@@ -70,6 +71,7 @@ flags.DEFINE_integer("utd_ratio", 20, "Update to data ratio.")
 flags.DEFINE_boolean("binary_include_bc", True, "Whether to include BC data in the binary datasets.")
 flags.DEFINE_boolean("pretrain_r", True, "Whether to include BC data in the binary datasets.")
 flags.DEFINE_boolean("pretrain_q", True, "Whether to include BC data in the binary datasets.")
+flags.DEFINE_boolean("use_image_obs", False, "Use image observations.")
 config_flags.DEFINE_config_file(
     "config", "faster/agents/faster_expo_learner.py", "File path to the training hyperparameter configuration.", lock_config=False
 )
@@ -82,8 +84,17 @@ def main(_):
         f"Public release only supports robomimic tasks {sorted(ENV_TO_HORIZON_MAP)}; got env_name={FLAGS.env_name!r}"
     )
 
+    exp_name = f"{FLAGS.env_name}_{FLAGS.dataset_dir}"
+    if getattr(FLAGS, "use_image_obs", False):
+        exp_name += "_image"
+    else:
+        exp_name += "_lowdim"
+    exp_name += f"_{datetime.now().strftime('%Y%m%d_%H%M%S')}__s{FLAGS.seed}"
+    if "SLURM_JOB_ID" in os.environ:
+        exp_name += f"_id{os.environ['SLURM_JOB_ID']}"
+
     code_root = os.path.dirname(os.path.abspath(__file__))
-    wandb_init_kwargs = {"project": FLAGS.project_name, "tags": FLAGS.wandb_tags}
+    wandb_init_kwargs = {"project": FLAGS.project_name, "tags": FLAGS.wandb_tags, "name": exp_name}
     if FLAGS.wandb_run_group != "":
         wandb_init_kwargs["group"] = FLAGS.wandb_run_group
     if FLAGS.wandb_entity is not None:
@@ -104,11 +115,6 @@ def main(_):
     np.random.seed(FLAGS.seed)
     rng = np.random.default_rng(FLAGS.seed)
 
-    exp_name = f"{datetime.now().strftime('%Y_%m_%d__%H_%M_%S')}__"
-    if "SLURM_JOB_ID" in os.environ:
-        exp_name += f"id{os.environ['SLURM_JOB_ID']}_"
-    exp_name += f"s{FLAGS.seed}"
-
     log_dir = os.path.join(FLAGS.log_dir, exp_name)
     os.makedirs(log_dir, exist_ok=True)
     with open(os.path.join(log_dir, "flags.json"), "w") as f:
@@ -119,30 +125,38 @@ def main(_):
         f.write("\n")
 
     if FLAGS.checkpoint_model:
-        chkpt_dir = os.path.join(log_dir, "checkpoints")
+        chkpt_dir = os.path.abspath(os.path.join(log_dir, "checkpoints"))
         os.makedirs(chkpt_dir, exist_ok=True)
 
     if FLAGS.checkpoint_buffer:
-        buffer_dir = os.path.join(log_dir, "buffers")
+        buffer_dir = os.path.abspath(os.path.join(log_dir, "buffers"))
         os.makedirs(buffer_dir, exist_ok=True)
 
     robomimic_root = robomimic_datasets_root(Path("datasets/robomimic"))
-    dataset_path = _resolve_robomimic_dataset_path(robomimic_root, FLAGS.env_name, "ph")
+    dataset_path = _resolve_robomimic_dataset_path(robomimic_root, FLAGS.env_name, "ph", getattr(FLAGS, "use_image_obs", False))
     if FLAGS.dataset_dir not in {"", "mh", "ph"}:
         with open(FLAGS.dataset_dir, "rb") as handle:
             dataset = pickle.load(handle)
         dataset["rewards"] = np.asarray(dataset["rewards"]).squeeze()
         dataset["terminals"] = np.asarray(dataset["terminals"]).squeeze()
     elif FLAGS.dataset_dir == "mh":
-        dataset = _load_robomimic_dataset(_resolve_robomimic_dataset_path(robomimic_root, FLAGS.env_name, "mh"))
+        dataset = _load_robomimic_dataset(_resolve_robomimic_dataset_path(robomimic_root, FLAGS.env_name, "mh"), use_image_obs=FLAGS.use_image_obs)
     else:
-        dataset = _load_robomimic_dataset(dataset_path)
+        dataset = _load_robomimic_dataset(dataset_path, use_image_obs=FLAGS.use_image_obs)
 
     ds = RoboD4RLDataset(env=None, num_data=FLAGS.num_data, custom_dataset=dataset)
-    example_observation = ds.dataset_dict["observations"][0][np.newaxis]
+    
+    if FLAGS.use_image_obs:
+        example_observation = {
+            "state": ds.dataset_dict["observations"]["state"][0][np.newaxis],
+            "image": ds.dataset_dict["observations"]["image"][0][np.newaxis],
+        }
+    else:
+        example_observation = ds.dataset_dict["observations"][0][np.newaxis]
+    
     example_action = ds.dataset_dict["actions"][0][np.newaxis]
-    env = get_robomimic_env(str(dataset_path), example_action, FLAGS.env_name)
-    eval_env = get_robomimic_env(str(dataset_path), example_action, FLAGS.env_name)
+    env = get_robomimic_env(str(dataset_path), example_action, FLAGS.env_name, use_image_obs=FLAGS.use_image_obs)
+    eval_env = get_video_robomimic_env(str(dataset_path), example_action, FLAGS.env_name, render_offscreen=FLAGS.save_video, use_image_obs=FLAGS.use_image_obs)
     max_traj_len = ENV_TO_HORIZON_MAP[FLAGS.env_name]
 
     ds.seed(FLAGS.seed)
@@ -157,12 +171,12 @@ def main(_):
             state_input = ds.dataset_dict["states"][0][np.newaxis]
         else:
             state_input = example_observation
-        agent = create_fn(FLAGS.seed, example_observation.squeeze(), example_action.squeeze(), state_input.squeeze(), **kwargs)
+        agent = create_fn(FLAGS.seed, jax.tree_map(lambda x: x.squeeze(), example_observation), example_action.squeeze(), jax.tree_map(lambda x: x.squeeze(), state_input), **kwargs)
     else:
-        agent = create_fn(FLAGS.seed, example_observation.squeeze(), example_action.squeeze(), **kwargs)
+        agent = create_fn(FLAGS.seed, jax.tree_map(lambda x: x.squeeze(), example_observation), example_action.squeeze(), **kwargs)
     print_agent_param_summary(agent)
 
-    replay_buffer = RoboReplayBuffer(example_observation.squeeze(), example_action.squeeze(), FLAGS.max_steps)
+    replay_buffer = RoboReplayBuffer(jax.tree_map(lambda x: x.squeeze(), example_observation), example_action.squeeze(), FLAGS.max_steps)
     replay_buffer.seed(FLAGS.seed)
 
     train_logger = CsvLogger(os.path.join(log_dir, "train.csv"))
@@ -184,13 +198,14 @@ def main(_):
                 train_logger.log({"event": "offline-training", "metric": k, "value": v}, step=i)
 
         if i % FLAGS.offline_eval_interval == 0:
-            eval_info = maybe_evaluate_robo(
+            eval_info = maybe_evaluate_robo_with_wandb_video(
                 agent,
                 eval_env,
                 max_traj_len=max_traj_len,
                 num_episodes=FLAGS.eval_episodes,
                 step=i,
                 skip_initial_eval=FLAGS.skip_initial_eval,
+                save_video=FLAGS.save_video,
             )
 
             for k, v in eval_info.items():
@@ -243,25 +258,23 @@ def main(_):
                     train_logger.log({"event": "training", "metric": k, "value": v}, step=i + FLAGS.pretrain_steps)
 
         if i % FLAGS.eval_interval == 0:
-            eval_info = maybe_evaluate_robo(
-                agent,
-                eval_env,
-                max_traj_len=max_traj_len,
-                num_episodes=FLAGS.eval_episodes,
-                step=i,
-                skip_initial_eval=FLAGS.skip_initial_eval,
-                save_video=FLAGS.save_video,
-            )
-
-            for k, v in eval_info.items():
-                wandb.log({f"evaluation/{k}": v}, step=i + FLAGS.pretrain_steps)
-                eval_logger.log({"event": "evaluation", "metric": k, "value": v}, step=i + FLAGS.pretrain_steps)
-
             if FLAGS.checkpoint_model:
                 try:
-                    checkpoints.save_checkpoint(chkpt_dir, agent, step=i, keep=FLAGS.checkpoint_keep, overwrite=True)
-                except:
-                    print("Could not save model checkpoint.")
+                    import flax
+                    ckpt_path = os.path.join(chkpt_dir, f"checkpoint_{i}.msgpack")
+                    with open(ckpt_path, "wb") as f:
+                        f.write(flax.serialization.to_bytes(agent))
+                    
+                    # Manage checkpoint keeping manually
+                    import glob
+                    all_ckpts = sorted(glob.glob(os.path.join(chkpt_dir, "checkpoint_*.msgpack")), key=os.path.getmtime)
+                    while len(all_ckpts) > FLAGS.checkpoint_keep:
+                        oldest = all_ckpts.pop(0)
+                        os.remove(oldest)
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    print(f"Could not save model checkpoint: {e}")
 
             if FLAGS.checkpoint_buffer:
                 try:
@@ -269,6 +282,14 @@ def main(_):
                         pickle.dump(replay_buffer, f, pickle.HIGHEST_PROTOCOL)
                 except:
                     print("Could not save agent buffer.")
+
+            eval_metrics = maybe_evaluate_robo_with_wandb_video(
+                agent, eval_env, max_traj_len, FLAGS.eval_episodes, i, FLAGS.skip_initial_eval, save_video=FLAGS.save_video
+            )
+
+            for k, v in eval_metrics.items():
+                wandb.log({f"evaluation/{k}": v}, step=i + FLAGS.pretrain_steps)
+                eval_logger.log({"event": "evaluation", "metric": k, "value": v}, step=i + FLAGS.pretrain_steps)
 
     train_logger.close()
     eval_logger.close()

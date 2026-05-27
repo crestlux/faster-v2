@@ -9,9 +9,10 @@ from robomimic import DATASET_REGISTRY
 from tqdm import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SUPPORTED_ENVS = ("lift", "can", "square", "tool_hang")
-SUPPORTED_SPLITS = ("ph",)
-HDF5_TYPE = "low_dim"
+SUPPORTED_ENVS = ("lift", "can", "square", "tool_hang", "transport")
+SUPPORTED_SPLITS = ("ph", "mh")
+HDF5_TYPE = "image"
+# HDF5_TYPE = "low_dim"
 ROBOMIMIC_GIT_URL = "https://github.com/ARISE-Initiative/robomimic"
 
 
@@ -94,7 +95,7 @@ def _download_dataset(url, download_dir, dry_run):
 def main(
     envs: tuple[str, ...] = SUPPORTED_ENVS,
     splits: tuple[str, ...] = SUPPORTED_SPLITS,
-    root: Path = Path("datasets/robomimic"),
+    root: Path = Path(f"datasets/robomimic/{HDF5_TYPE}"),
     dry_run: bool = False,
 ):
     expected_rev = _read_expected_robomimic_rev(REPO_ROOT / "pyproject.toml")
@@ -105,6 +106,7 @@ def main(
     requested_envs = _normalize_requested(envs, SUPPORTED_ENVS, "envs")
     requested_splits = _normalize_requested(splits, SUPPORTED_SPLITS, "splits")
     download_root = _resolve_root(root)
+    print(f"Downloading f{HDF5_TYPE} robomimic datasets for envs={requested_envs} splits={requested_splits}")
     print(f"Using robomimic revision: {installed_rev}")
     print(f"Download root: {download_root}")
     targets = tuple(_iter_downloads(requested_envs, requested_splits))

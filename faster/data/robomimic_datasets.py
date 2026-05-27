@@ -8,7 +8,10 @@ from robomimic.config import config_factory
 
 from faster.data.dataset import Dataset
 
-OBS_KEYS = ("robot0_eef_pos", "robot0_eef_quat", "robot0_gripper_qpos", "object")
+# For low_dim, we use "object" state. For images, we use vision + proprioception only
+PROPRIOCEPTION_KEYS = ("robot0_eef_pos", "robot0_eef_quat", "robot0_gripper_qpos")
+LOW_DIM_OBS_KEYS = PROPRIOCEPTION_KEYS + ("object",)
+IMAGE_OBS_KEYS = ("agentview_image", "robot0_eye_in_hand_image")
 ENV_TO_HORIZON_MAP = {"lift": 400, "can": 400, "square": 400, "transport": 700, "tool_hang": 700}
 
 
@@ -52,10 +55,12 @@ def _reset_robomimic_playback_env(env):
 
 
 class RobosuiteGymWrapper:
-    def __init__(self, env, horizon, example_action):
+    def __init__(self, env, horizon, example_action, obs_keys=LOW_DIM_OBS_KEYS, use_image_obs=False):
         self.env = env
         self.horizon = horizon
         self.action_space = example_action
+        self.obs_keys = obs_keys
+        self.use_image_obs = use_image_obs
         self.timestep = 0
         self.returns = 0.0
 
@@ -85,46 +90,121 @@ class RobosuiteGymWrapper:
         return self.env.render(mode=mode, height=height, width=width)
 
     def _process_obs(self, obs):
-        return np.concatenate([obs[key] for key in OBS_KEYS], axis=-1)
+        if self.use_image_obs:
+            state = np.concatenate([obs[key] for key in PROPRIOCEPTION_KEYS], axis=-1)
+            # Assuming agentview_image is the primary image. If using multiple, we can stack or concatenate along channel
+            # We'll concatenate them along the channel dimension for simplicity
+            images = []
+            for key in IMAGE_OBS_KEYS:
+                img = obs[key]
+                if img.ndim == 3 and img.shape[0] == 3:
+                    img = img.transpose(1, 2, 0)
+                images.append(img)
+            image = np.concatenate(images, axis=-1)
+            return {"state": state, "image": image}
+        else:
+            return np.concatenate([obs[key] for key in self.obs_keys], axis=-1)
 
 
-def process_robomimic_dataset(seq_dataset):
+def process_robomimic_dataset(seq_dataset, use_image_obs=False):
     cached = seq_dataset.getitem_cache
-    observations = []
-    next_observations = []
+    
+    if use_image_obs:
+        obs_states, next_obs_states = [], []
+        obs_images, next_obs_images = [], []
+    else:
+        observations = []
+        next_observations = []
+
     actions = []
     rewards = []
     terminals = []
 
     for item in cached:
-        observations.append(np.concatenate([item["obs"][key] for key in OBS_KEYS], axis=1))
-        next_observations.append(np.concatenate([item["next_obs"][key] for key in OBS_KEYS], axis=1))
+        if use_image_obs:
+            obs_states.append(np.concatenate([item["obs"][key] for key in PROPRIOCEPTION_KEYS], axis=1))
+            next_obs_states.append(np.concatenate([item["next_obs"][key] for key in PROPRIOCEPTION_KEYS], axis=1))
+            
+            o_imgs = []
+            n_imgs = []
+            for key in IMAGE_OBS_KEYS:
+                o_img = item["obs"][key]
+                if o_img.ndim == 4 and o_img.shape[1] == 3:
+                    o_img = o_img.transpose(0, 2, 3, 1)
+                elif o_img.ndim == 3 and o_img.shape[0] == 3:
+                    o_img = o_img.transpose(1, 2, 0)
+                o_imgs.append(o_img)
+                
+                n_img = item["next_obs"][key]
+                if n_img.ndim == 4 and n_img.shape[1] == 3:
+                    n_img = n_img.transpose(0, 2, 3, 1)
+                elif n_img.ndim == 3 and n_img.shape[0] == 3:
+                    n_img = n_img.transpose(1, 2, 0)
+                n_imgs.append(n_img)
+                
+            obs_images.append(np.concatenate(o_imgs, axis=-1))
+            next_obs_images.append(np.concatenate(n_imgs, axis=-1))
+        else:
+            observations.append(np.concatenate([item["obs"][key] for key in LOW_DIM_OBS_KEYS], axis=1))
+            next_observations.append(np.concatenate([item["next_obs"][key] for key in LOW_DIM_OBS_KEYS], axis=1))
+
         actions.append(np.asarray(item["actions"]))
         rewards.append(np.asarray(item["rewards"]))
         terminals.append(np.asarray(item["dones"]))
 
-    return {
-        "observations": np.concatenate(observations).astype(np.float32),
-        "actions": np.concatenate(actions).astype(np.float32),
-        "rewards": np.concatenate(rewards).astype(np.float32),
-        "terminals": np.concatenate(terminals).astype(np.float32),
-        "next_observations": np.concatenate(next_observations).astype(np.float32),
-    }
+    actions = np.concatenate(actions).astype(np.float32)
+    rewards = np.concatenate(rewards).astype(np.float32)
+    terminals = np.concatenate(terminals).astype(np.float32)
+
+    if use_image_obs:
+        return {
+            "observations": {
+                "state": np.concatenate(obs_states).astype(np.float32),
+                "image": np.concatenate(obs_images).astype(np.uint8),  # keep uint8 to save memory
+            },
+            "actions": actions,
+            "rewards": rewards,
+            "terminals": terminals,
+            "next_observations": {
+                "state": np.concatenate(next_obs_states).astype(np.float32),
+                "image": np.concatenate(next_obs_images).astype(np.uint8),
+            },
+        }
+    else:
+        return {
+            "observations": np.concatenate(observations).astype(np.float32),
+            "actions": actions,
+            "rewards": rewards,
+            "terminals": terminals,
+            "next_observations": np.concatenate(next_observations).astype(np.float32),
+        }
 
 
-def get_robomimic_env(dataset_path, example_action, env_name):
+def get_robomimic_env(dataset_path, example_action, env_name, use_image_obs=False):
     assert env_name in ENV_TO_HORIZON_MAP, env_name
     _patch_robosuite_offscreen_context()
-    ObsUtils.initialize_obs_utils_with_config(config_factory(algo_name="iql"))
+    config = config_factory(algo_name="iql")
+    if use_image_obs:
+        config.observation.modalities.obs.rgb = list(IMAGE_OBS_KEYS)
+    ObsUtils.initialize_obs_utils_with_config(config)
     env_meta = _load_robomimic_env_meta(dataset_path)
-    env = EnvUtils.create_env_from_metadata(env_meta=env_meta, render=False, render_offscreen=False, use_image_obs=False)
-    return RobosuiteGymWrapper(env, ENV_TO_HORIZON_MAP[env_name], example_action)
+    env = EnvUtils.create_env_from_metadata(env_meta=env_meta, render=False, render_offscreen=use_image_obs, use_image_obs=use_image_obs)
+    obs_keys = PROPRIOCEPTION_KEYS + IMAGE_OBS_KEYS if use_image_obs else LOW_DIM_OBS_KEYS
+    return RobosuiteGymWrapper(env, ENV_TO_HORIZON_MAP[env_name], example_action, obs_keys=obs_keys, use_image_obs=use_image_obs)
 
 
 def _episode_dones(observations, next_observations, terminals, ignore_done):
     dones = np.zeros_like(terminals, dtype=np.float32)
+    # Handle both dict (image + state) and flat array (lowdim)
+    if isinstance(observations, dict) and "state" in observations:
+        obs_array = observations["state"]
+        next_obs_array = next_observations["state"]
+    else:
+        obs_array = observations
+        next_obs_array = next_observations
+
     for i in range(len(dones) - 1):
-        transition_break = np.linalg.norm(observations[i + 1] - next_observations[i]) > 1e-6
+        transition_break = np.linalg.norm(obs_array[i + 1] - next_obs_array[i]) > 1e-6
         if ignore_done:
             dones[i] = float(transition_break)
         else:
@@ -142,26 +222,43 @@ def _truncate_dataset_by_episodes(dataset_dict, num_data):
     keep.append(done_indices[-1])
     total_len = keep[num_data] - keep[0]
     for key, value in dataset_dict.items():
-        dataset_dict[key] = value[:total_len]
+        if isinstance(value, dict):
+            for k in value.keys():
+                value[k] = value[k][:total_len]
+        else:
+            dataset_dict[key] = value[:total_len]
 
 
 class RoboD4RLDataset(Dataset):
     def __init__(self, env, clip_to_eps=True, eps=1e-5, num_data=0, ignore_done=False, custom_dataset=None):
         assert custom_dataset is not None, "Public release RoboD4RLDataset only supports custom_dataset input."
-        dataset = {key: np.asarray(value).copy() for key, value in custom_dataset.items()}
+        dataset = {}
+        for key, value in custom_dataset.items():
+            if isinstance(value, dict):
+                dataset[key] = {k: np.asarray(v).copy() for k, v in value.items()}
+            else:
+                dataset[key] = np.asarray(value).copy()
+
         if clip_to_eps:
             lim = 1 - eps
             dataset["actions"] = np.clip(dataset["actions"], -lim, lim)
 
         dones = _episode_dones(dataset["observations"], dataset["next_observations"], dataset["terminals"], ignore_done)
+        
         dataset_dict = {
-            "observations": dataset["observations"].astype(np.float32),
             "actions": dataset["actions"].astype(np.float32),
             "rewards": dataset["rewards"].astype(np.float32),
             "masks": 1.0 - dataset["terminals"].astype(np.float32),
             "dones": dones.astype(np.float32),
-            "next_observations": dataset["next_observations"].astype(np.float32),
         }
+        
+        if isinstance(dataset["observations"], dict):
+            dataset_dict["observations"] = {k: v.copy() for k, v in dataset["observations"].items()}
+            dataset_dict["next_observations"] = {k: v.copy() for k, v in dataset["next_observations"].items()}
+        else:
+            dataset_dict["observations"] = dataset["observations"].astype(np.float32)
+            dataset_dict["next_observations"] = dataset["next_observations"].astype(np.float32)
+
         if num_data != 0:
             _truncate_dataset_by_episodes(dataset_dict, num_data)
         super().__init__(dataset_dict)
