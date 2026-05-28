@@ -3,6 +3,7 @@ from typing import Dict
 
 import gym
 import numpy as np
+import tqdm as tqdm_lib
 import robomimic.utils.env_utils as EnvUtils
 import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.obs_utils as ObsUtils
@@ -18,6 +19,7 @@ from faster.data.robomimic_datasets import (
     _patch_robosuite_offscreen_context,
     get_robomimic_env,
 )
+from faster.evaluation import ActionChunkWrapper
 
 
 def _load_video_env_meta(dataset_path):
@@ -96,9 +98,14 @@ def _render_rgb(env, height: int = 256, width: int = 256):
 
 def _sample_eval_trajectories(env, policy, num_episodes: int, max_traj_len: int, record_video: bool):
     env = _as_video_env(env) if record_video else env
+    # For action-chunked envs, step the inner env one action at a time during video
+    # recording so every simulation frame is captured, not just one per chunk.
+    _chunk_env = env if (record_video and isinstance(env, ActionChunkWrapper)) else None
     trajs = []
     render_error = None
-    for episode_idx in range(num_episodes):
+    successes = 0
+    pbar = tqdm_lib.tqdm(range(num_episodes), desc="eval", unit="ep", dynamic_ncols=True, leave=False)
+    for episode_idx in pbar:
         observation = env.reset()
         rewards = []
         steps = []
@@ -116,18 +123,51 @@ def _sample_eval_trajectories(env, policy, num_episodes: int, max_traj_len: int,
 
         while not done and traj_steps < max_traj_len:
             action = np.asarray(policy(observation))
-            observation, reward, done, info = env.step(action)
+
+            if should_record and _chunk_env is not None:
+                # Step each sub-action individually so we capture one frame per
+                # simulation step instead of one frame per exec_horizon steps.
+                actions_2d = action.reshape(_chunk_env.chunk_size, -1)
+                execute = actions_2d[: _chunk_env.exec_horizon]
+                total_reward = 0.0
+                steps_taken = 0
+                info = {}
+                for a in execute:
+                    observation, sub_reward, done, info = _chunk_env.env.step(a)
+                    total_reward += sub_reward
+                    steps_taken += 1
+                    try:
+                        frames.append(_render_rgb(env))
+                    except Exception as exc:
+                        render_error = repr(exc)
+                        should_record = False
+                        break
+                    if done:
+                        break
+                reward = total_reward
+                if info is None:
+                    info = {}
+                info["chunk_steps"] = steps_taken
+            else:
+                observation, reward, done, info = env.step(action)
+                if should_record:
+                    try:
+                        frames.append(_render_rgb(env))
+                    except Exception as exc:
+                        render_error = repr(exc)
+                        should_record = False
+
             info = {} if info is None else info
             rewards.append(reward)
             step_count = int(info.get("chunk_steps", 1))
             steps.append(step_count)
             traj_steps += step_count
-            if should_record:
-                try:
-                    frames.append(_render_rgb(env))
-                except Exception as exc:
-                    render_error = repr(exc)
-                    should_record = False
+
+        ep_return = float(np.sum(rewards))
+        success = ep_return > 0
+        if success:
+            successes += 1
+        pbar.set_postfix({"ret": f"{ep_return:.2f}", "succ": f"{successes}/{episode_idx+1}"})
 
         traj = {
             "rewards": np.asarray(rewards, dtype=np.float32),
@@ -138,6 +178,7 @@ def _sample_eval_trajectories(env, policy, num_episodes: int, max_traj_len: int,
         if render_error is not None:
             traj["render_error"] = render_error
         trajs.append(traj)
+    pbar.close()
     return trajs
 
 

@@ -10,3 +10,4 @@ third_party/
 logs/
 scripts/plots/archive
 /plots/
+*.md

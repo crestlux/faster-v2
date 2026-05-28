@@ -13,6 +13,7 @@ from flax.training.train_state import TrainState
 
 from faster.agents.agent import Agent
 from faster.data.dataset import DatasetDict
+from faster.networks.resnet import ImageStateEncoder, get_resnet18
 from faster.networks import (
     DDPM,
     MLP,
@@ -49,19 +50,20 @@ def compute_q_with_time(critic_fn, critic_params, observations, actions, time):
 
 @jax.jit
 def _sample_actions_jit(agent, observations):
-    # Safely add batch dimension if missing (1D for state, 3D for image)
     observations = jax.tree_map(lambda x: jnp.expand_dims(x, axis=0) if jnp.asarray(x).ndim in (1, 3) else jnp.asarray(x), observations)
-    observations = jax.device_put(observations)
     actions, rng = agent._sample_filtered_diffusion_candidates(observations, agent.N, agent.target_actor.params)
     actions = actions.reshape(-1, agent.action_dim)
-    obs_rep = observations
+    n_candidates = actions.shape[0]
+    # B: critic expects flat encoded obs (initialized with encoded features)
+    obs_enc = agent._get_obs_encoding(observations, agent.target_actor.params)
+    obs_rep = jax.tree_map(lambda x: jnp.repeat(x, n_candidates // x.shape[0], axis=0), obs_enc)
     qs = compute_q(agent.target_critic.apply_fn, agent.target_critic.params, obs_rep, actions)
     action = actions[jnp.argmax(qs)]
     rng, _ = jax.random.split(rng)
     return action, rng
 
 
-@partial(jax.jit, static_argnames=("actor_apply_fn", "act_dim", "T", "repeat_last_step", "training", "use_ddim"))
+@partial(jax.jit, static_argnames=("actor_apply_fn", "act_dim", "T", "repeat_last_step", "training", "use_ddim", "eta"))
 def diffusion_sampler_from_x(
     actor_apply_fn,
     actor_params,
@@ -79,32 +81,33 @@ def diffusion_sampler_from_x(
     *,
     use_ddim=False,
     eta: float = 0.0,
+    obs_encoding=None,
 ):
     noise_key, rng = jax.random.split(rng)
 
     def step(current_x, time):
         input_time = jnp.full((current_x.shape[0], 1), time)
-        eps_pred = actor_apply_fn({"params": actor_params}, observations, current_x, input_time, training=training)
+        eps_pred = actor_apply_fn({"params": actor_params}, observations, current_x, input_time, training=training, obs_encoding=obs_encoding)
 
         if use_ddim:
             alpha_hat_t = alpha_hats[time]
             sqrt_alpha_hat_t = jnp.sqrt(alpha_hat_t)
             sqrt_one_minus_alpha_hat_t = jnp.sqrt(1.0 - alpha_hat_t)
             x0_pred = (current_x - sqrt_one_minus_alpha_hat_t * eps_pred) / sqrt_alpha_hat_t
-            alpha_hat_prev = jax.lax.cond(time > 0, lambda t: alpha_hats[t - 1], lambda _: jnp.asarray(1.0, dtype=alpha_hat_t.dtype), time)
-            eta_ = jnp.asarray(eta, dtype=current_x.dtype)
-
-            def deterministic(_):
-                return jnp.sqrt(alpha_hat_prev) * x0_pred + jnp.sqrt(1.0 - alpha_hat_prev) * eps_pred
-
-            def stochastic(_):
-                sigma = eta_ * jnp.sqrt((1.0 - alpha_hat_prev) / (1.0 - alpha_hat_t) * (1.0 - alpha_hat_t / alpha_hat_prev))
+            # jnp.where cheaper than lax.cond inside scan
+            alpha_hat_prev = jnp.where(
+                time > 0,
+                alpha_hats[jnp.maximum(0, time - 1)],
+                jnp.asarray(1.0, dtype=alpha_hat_t.dtype),
+            )
+            # eta is static → branch resolved at trace time
+            if eta == 0.0:
+                current_x = jnp.sqrt(alpha_hat_prev) * x0_pred + jnp.sqrt(1.0 - alpha_hat_prev) * eps_pred
+            else:
+                sigma = eta * jnp.sqrt((1.0 - alpha_hat_prev) / (1.0 - alpha_hat_t) * (1.0 - alpha_hat_t / alpha_hat_prev))
                 z = jax.random.normal(jax.random.fold_in(noise_key, time), shape=current_x.shape)
-                noise = sigma * z
                 eps_scale = jnp.sqrt(jnp.maximum(0.0, 1.0 - alpha_hat_prev - sigma**2))
-                return jnp.sqrt(alpha_hat_prev) * x0_pred + eps_scale * eps_pred + noise
-
-            current_x = jax.lax.cond(eta_ == 0.0, deterministic, stochastic, operand=None)
+                current_x = jnp.sqrt(alpha_hat_prev) * x0_pred + eps_scale * eps_pred + sigma * z
         else:
             alpha_1 = 1.0 / jnp.sqrt(alphas[time])
             alpha_2 = (1.0 - alphas[time]) / jnp.sqrt(1.0 - alpha_hats[time])
@@ -114,7 +117,6 @@ def diffusion_sampler_from_x(
             current_x = current_x + noise_scale * z
 
         current_x = jnp.clip(current_x, -1, 1)
-
         return current_x, ()
 
     current_x, () = jax.lax.scan(step, init_x, jnp.arange(T - 1, -1, -1))
@@ -220,6 +222,22 @@ class FasterIDQLLearner(Agent):
     filter_temperature_eval: float = struct.field(pytree_node=False)
     filter_temperature_mode: str = struct.field(pytree_node=False)
     ddim_eta: float = struct.field(pytree_node=False)
+    chunk_size: int = struct.field(pytree_node=False)
+
+    def _get_obs_encoding(self, observations, actor_params):
+        """Encode observations using the actor's shared image encoder (B).
+        Returns flat encoded features for image obs, or raw observations for low-dim.
+        Safe to call inside jax.jit — uses actor_params["ImageStateEncoder_0"] directly.
+        """
+        if not (isinstance(observations, dict) and "image" in observations):
+            return observations
+        if "ImageStateEncoder_0" not in actor_params:
+            return observations  # custom obs_encoder_cls path; fall back to raw
+        return ImageStateEncoder(encoder_cls=get_resnet18).apply(
+            {"params": actor_params["ImageStateEncoder_0"]},
+            observations,
+            training=False,
+        )
 
     @classmethod
     def create(
@@ -261,6 +279,7 @@ class FasterIDQLLearner(Agent):
         filter_at_eval: bool = False,
         filter_temperature_eval: float = 0.0,
         filter_temperature_mode: str = "plain",
+        chunk_size: int = 1,
     ):
         action_dim = action_space.shape[-1]
         _validate_filter_temperature_mode(filter_temperature_mode)
@@ -305,6 +324,15 @@ class FasterIDQLLearner(Agent):
             apply_fn=actor_def.apply, params=actor_params, tx=optax.GradientTransformation(lambda _: None, lambda _: None)
         )
 
+        # B: encode example obs using actor's encoder so critic/value/filter are initialized
+        # with flat features — they never build their own ImageStateEncoder params.
+        if isinstance(observations, dict) and "image" in observations and "ImageStateEncoder_0" in actor_params:
+            example_obs_enc = ImageStateEncoder(encoder_cls=get_resnet18).apply(
+                {"params": actor_params["ImageStateEncoder_0"]}, observations, training=False
+            )
+        else:
+            example_obs_enc = observations
+
         if beta_schedule == "cosine":
             betas = jnp.array(cosine_beta_schedule(T))
         elif beta_schedule == "linear":
@@ -330,7 +358,7 @@ class FasterIDQLLearner(Agent):
             )
         critic_cls = partial(StateActionValue, base_cls=critic_base_cls)
         critic_def = Ensemble(critic_cls, num=num_qs)
-        critic_params = critic_def.init(critic_key, observations, actions)["params"]
+        critic_params = critic_def.init(critic_key, example_obs_enc, actions)["params"]
         if critic_weight_decay is not None:
             critic_tx = optax.adamw(learning_rate=critic_lr, weight_decay=critic_weight_decay, mask=decay_mask_fn)
         else:
@@ -350,7 +378,7 @@ class FasterIDQLLearner(Agent):
             use_pnorm=use_pnorm,
         )
         value_def = StateValue(base_cls=value_base_cls)
-        value_params = value_def.init(value_key, observations)["params"]
+        value_params = value_def.init(value_key, example_obs_enc)["params"]
         if critic_weight_decay is not None:
             value_tx = optax.adamw(learning_rate=critic_lr, weight_decay=critic_weight_decay, mask=decay_mask_fn)
         else:
@@ -369,7 +397,7 @@ class FasterIDQLLearner(Agent):
             )
             filter_def = Ensemble(filter_cls, num=1)
             filter_time = jnp.full((1, 1), T, dtype=jnp.int32)
-            filter_params = filter_def.init(filter_key, observations, actions, filter_time)["params"]
+            filter_params = filter_def.init(filter_key, example_obs_enc, actions, filter_time)["params"]
             if critic_weight_decay is not None:
                 filter_tx = optax.adamw(learning_rate=critic_lr, weight_decay=critic_weight_decay, mask=decay_mask_fn)
             else:
@@ -407,11 +435,15 @@ class FasterIDQLLearner(Agent):
             filter_temperature_eval=filter_temperature_eval,
             filter_temperature_mode=filter_temperature_mode,
             ddim_eta=float(ddim_eta),
+            chunk_size=int(chunk_size),
         )
 
     def _sample_diffusion_candidates(self, observations, N: int, actor_params):
         batch_size = jax.tree_util.tree_leaves(observations)[0].shape[0]
-        observations_repeated = observations
+        # B+A: encode once, repeat N times, skip per-step encoding inside ddim_sampler
+        obs_enc = self._get_obs_encoding(observations, actor_params)
+        obs_enc_repeated = jnp.repeat(obs_enc, N, axis=0)
+        observations_repeated = jax.tree_map(lambda x: jnp.repeat(x, N, axis=0), observations)
         actions, rng = ddim_sampler(
             self.actor.apply_fn,
             actor_params,
@@ -424,6 +456,7 @@ class FasterIDQLLearner(Agent):
             self.betas,
             self.M,
             eta=self.ddim_eta,
+            obs_encoding=obs_enc_repeated,
         )
         return actions.reshape(batch_size, N, -1), rng
 
@@ -455,10 +488,13 @@ class FasterIDQLLearner(Agent):
 
     def _prepare_filter_critic_regression_batch(self, batch: DatasetDict, rng):
         observations = batch["observations"]
-        seed_actions, rng = self._sample_filter_seed_candidates(observations, self.train_N, rng)
-        filter_observations, filter_actions, rng = self._select_filter_candidates(observations, seed_actions, 1, 0.0, rng)
+        # B: encode for filter critic (DenoisingStateActionValue has no internal encoder)
+        obs_enc = self._get_obs_encoding(observations, self.target_actor.params)
+        seed_actions, rng = self._sample_filter_seed_candidates(obs_enc, self.train_N, rng)
+        filter_observations, filter_actions, rng = self._select_filter_candidates(obs_enc, seed_actions, 1, 0.0, rng)
         filter_observations = jax.tree_map(lambda x: x.reshape(-1, *x.shape[2:]), filter_observations)
         filter_actions = filter_actions.reshape(-1, self.action_dim)
+        # A: filter_observations is already encoded → pass as obs_encoding to skip T×encoding in scan
         outer_critic_actions, rng = diffusion_sampler_from_x(
             self.actor.apply_fn,
             self.target_actor.params,
@@ -474,6 +510,7 @@ class FasterIDQLLearner(Agent):
             self.M,
             use_ddim=True,
             eta=self.ddim_eta,
+            obs_encoding=filter_observations,
         )
         q_targets = compute_q(self.target_critic.apply_fn, self.target_critic.params, filter_observations, outer_critic_actions)
         return filter_observations, filter_actions, q_targets, rng
@@ -486,15 +523,20 @@ class FasterIDQLLearner(Agent):
         if not needs_filter:
             return self._sample_diffusion_candidates(observations, N, actor_params)
 
-        seed_actions, rng = self._sample_filter_seed_candidates(observations, N, self.rng)
-        obs_rep, seed_actions, rng = self._select_filter_candidates(observations, seed_actions, 1, self.filter_temperature_eval, rng)
+        batch_size = jax.tree_util.tree_leaves(observations)[0].shape[0]
+        # B: encode once for filter critic
+        obs_enc = self._get_obs_encoding(observations, actor_params)
+        seed_actions, rng = self._sample_filter_seed_candidates(obs_enc, N, self.rng)
+        obs_rep, seed_actions, rng = self._select_filter_candidates(obs_enc, seed_actions, 1, self.filter_temperature_eval, rng)
+        obs_rep_flat = jax.tree_map(lambda x: x.reshape(-1, *x.shape[2:]), obs_rep)
+        # A: obs_rep_flat is already encoded → pass as obs_encoding to skip T×encoding in scan
         final_actions, rng = diffusion_sampler_from_x(
             self.actor.apply_fn,
             actor_params,
             self.T,
             rng,
             self.action_dim,
-            jax.tree_map(lambda x: x.reshape(-1, *x.shape[2:]), obs_rep),
+            obs_rep_flat,
             seed_actions.reshape(-1, self.action_dim),
             self.alphas,
             self.alpha_hats,
@@ -503,6 +545,7 @@ class FasterIDQLLearner(Agent):
             self.M,
             use_ddim=True,
             eta=self.ddim_eta,
+            obs_encoding=obs_rep_flat,
         )
         return final_actions.reshape(batch_size, seed_actions.shape[1], -1), rng
 
@@ -565,7 +608,8 @@ class FasterIDQLLearner(Agent):
         rng = self.rng
         key, rng = jax.random.split(rng)
         next_q = self.value.apply_fn({"params": self.value.params}, batch["next_observations"], True, rngs={"dropout": key})
-        target_q = batch["rewards"] + self.discount * batch["masks"] * next_q
+        chunk_discount = self.discount ** self.chunk_size
+        target_q = batch["rewards"] + chunk_discount * batch["masks"] * next_q
 
         key, rng = jax.random.split(rng)
 
@@ -608,6 +652,10 @@ class FasterIDQLLearner(Agent):
     @partial(jax.jit, static_argnames=("utd_ratio", "pretrain_q", "pretrain_r"))
     def update_offline(self, batch: DatasetDict, utd_ratio: int, pretrain_q: bool, pretrain_r: bool):
         new_agent = self
+        # B: encode once; critic/value receive stop_gradient features (no encoder grad from TD)
+        obs_enc = jax.lax.stop_gradient(new_agent._get_obs_encoding(batch["observations"], new_agent.target_actor.params))
+        next_obs_enc = jax.lax.stop_gradient(new_agent._get_obs_encoding(batch["next_observations"], new_agent.target_actor.params))
+        encoded_batch = {**batch, "observations": obs_enc, "next_observations": next_obs_enc}
         for i in range(utd_ratio):
 
             def slice_fn(x):
@@ -615,17 +663,23 @@ class FasterIDQLLearner(Agent):
                 batch_size = x.shape[0] // utd_ratio
                 return x[batch_size * i : batch_size * (i + 1)]
 
-            mini_batch = jax.tree_util.tree_map(slice_fn, batch)
+            mini_batch = jax.tree_util.tree_map(slice_fn, encoded_batch)
             new_agent, value_info = new_agent.update_value(mini_batch)
             new_agent, critic_info = new_agent.update_critic(mini_batch)
 
-        new_agent, actor_info = new_agent.update_actor(mini_batch)
-        new_agent, filter_info = new_agent.update_filter_critic(mini_batch)
+        # Actor and filter critic use raw batch (actor's DDPM encodes internally → encoder trains)
+        actor_mini_batch = jax.tree_util.tree_map(slice_fn, batch)
+        new_agent, actor_info = new_agent.update_actor(actor_mini_batch)
+        new_agent, filter_info = new_agent.update_filter_critic(actor_mini_batch)
         return new_agent, {**actor_info, **critic_info, **value_info, **filter_info}
 
     @partial(jax.jit, static_argnames="utd_ratio")
     def update_separate(self, batch: DatasetDict, actor_batch: DatasetDict, utd_ratio: int):
         new_agent = self
+        # B: encode for critic UTD loop
+        obs_enc = jax.lax.stop_gradient(new_agent._get_obs_encoding(batch["observations"], new_agent.target_actor.params))
+        next_obs_enc = jax.lax.stop_gradient(new_agent._get_obs_encoding(batch["next_observations"], new_agent.target_actor.params))
+        encoded_batch = {**batch, "observations": obs_enc, "next_observations": next_obs_enc}
         for i in range(utd_ratio):
 
             def slice_fn(x):
@@ -633,7 +687,7 @@ class FasterIDQLLearner(Agent):
                 batch_size = x.shape[0] // utd_ratio
                 return x[batch_size * i : batch_size * (i + 1)]
 
-            mini_batch = jax.tree_util.tree_map(slice_fn, batch)
+            mini_batch = jax.tree_util.tree_map(slice_fn, encoded_batch)
             new_agent, critic_info = new_agent.update_critic(mini_batch)
 
         new_agent, actor_info = new_agent.update_actor(actor_batch)
@@ -643,6 +697,10 @@ class FasterIDQLLearner(Agent):
     @partial(jax.jit, static_argnames="utd_ratio")
     def update(self, batch: DatasetDict, utd_ratio: int):
         new_agent = self
+        # B: encode once; critic/value receive stop_gradient features (no encoder grad from TD)
+        obs_enc = jax.lax.stop_gradient(new_agent._get_obs_encoding(batch["observations"], new_agent.target_actor.params))
+        next_obs_enc = jax.lax.stop_gradient(new_agent._get_obs_encoding(batch["next_observations"], new_agent.target_actor.params))
+        encoded_batch = {**batch, "observations": obs_enc, "next_observations": next_obs_enc}
         for i in range(utd_ratio):
 
             def slice_fn(x):
@@ -650,12 +708,14 @@ class FasterIDQLLearner(Agent):
                 batch_size = x.shape[0] // utd_ratio
                 return x[batch_size * i : batch_size * (i + 1)]
 
-            mini_batch = jax.tree_util.tree_map(slice_fn, batch)
+            mini_batch = jax.tree_util.tree_map(slice_fn, encoded_batch)
             new_agent, value_info = new_agent.update_value(mini_batch)
             new_agent, critic_info = new_agent.update_critic(mini_batch)
 
-        new_agent, actor_info = new_agent.update_actor(mini_batch)
-        new_agent, filter_info = new_agent.update_filter_critic(mini_batch)
+        # Actor and filter critic use raw batch (actor's DDPM encodes internally → encoder trains)
+        actor_mini_batch = jax.tree_util.tree_map(slice_fn, batch)
+        new_agent, actor_info = new_agent.update_actor(actor_mini_batch)
+        new_agent, filter_info = new_agent.update_filter_critic(actor_mini_batch)
         return new_agent, {**actor_info, **value_info, **critic_info, **filter_info}
 
 
@@ -680,4 +740,5 @@ def get_config():
     config.filter_temperature_eval = 0.0
     config.filter_temperature_mode = "zscore"
     config.num_min_qs = 2
+    config.chunk_size = 1
     return config

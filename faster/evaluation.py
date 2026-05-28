@@ -4,6 +4,51 @@ import gym
 import numpy as np
 
 
+class ActionChunkWrapper:
+    """Wraps an env so a flat (chunk_size * action_dim) action is executed step-by-step.
+
+    Temporal ensemble / receding horizon:
+        chunk_size  — how many actions the policy predicts at once
+        exec_horizon — how many of those actions to actually execute before replanning
+                       (default: chunk_size → classic open-loop chunk execution)
+
+    With exec_horizon < chunk_size the policy is queried more frequently, giving it
+    more chances to react to the current observation (closed-loop / receding horizon).
+    The actor still learns to predict full chunk_size sequences from demonstrations,
+    but the critic/Q-function sees exec_horizon-step returns (consistent with execution).
+    """
+
+    def __init__(self, env, chunk_size: int, exec_horizon: int = None):
+        self.env = env
+        self.chunk_size = chunk_size
+        self.exec_horizon = exec_horizon if exec_horizon is not None else chunk_size
+        assert 1 <= self.exec_horizon <= self.chunk_size, (
+            f"exec_horizon={self.exec_horizon} must be in [1, chunk_size={self.chunk_size}]"
+        )
+
+    def step(self, flat_action: np.ndarray):
+        actions = flat_action.reshape(self.chunk_size, -1)
+        execute = actions[: self.exec_horizon]   # only the prefix
+        total_reward = 0.0
+        steps_taken = 0
+        obs = done = info = None
+        for a in execute:
+            obs, reward, done, info = self.env.step(a)
+            total_reward += reward
+            steps_taken += 1
+            if done:
+                break
+        info = {} if info is None else info
+        info["chunk_steps"] = steps_taken
+        return obs, total_reward, done, info
+
+    def reset(self):
+        return self.env.reset()
+
+    def __getattr__(self, name):
+        return getattr(self.env, name)
+
+
 class SamplerPolicy:
     def __init__(self, agent):
         self.agent = agent

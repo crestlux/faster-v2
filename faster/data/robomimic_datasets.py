@@ -229,6 +229,80 @@ def _truncate_dataset_by_episodes(dataset_dict, num_data):
             dataset_dict[key] = value[:total_len]
 
 
+def make_chunk_dataset(dataset_dict: dict, chunk_size: int, exec_horizon: int = None) -> dict:
+    """Convert a step-level dataset into a chunk-level dataset.
+
+    Each valid chunk starts at step t and spans [t, t+chunk_size).
+    Chunks that would cross an episode boundary (any dones[t..t+chunk_size-2] == 1)
+    are dropped so the model never trains on cross-episode transitions.
+
+    Args:
+        chunk_size:    Number of actions the policy predicts. The stored 'actions' field
+                       is a flattened (chunk_size * orig_action_dim,) vector so the actor
+                       can learn to predict full behavioural sequences from demonstrations.
+        exec_horizon:  Number of actions actually executed before replanning
+                       (temporal ensemble / receding horizon). Must satisfy
+                       1 <= exec_horizon <= chunk_size.
+                       Defaults to chunk_size (classic open-loop chunking).
+                       Controls the Bellman backup horizon:
+                         next_observations  <- obs after exec_horizon steps
+                         rewards            <- sum of first exec_horizon rewards
+                         masks / dones      <- status at step exec_horizon
+
+    Returns a new dataset dict with:
+      observations       <- obs at the start of the chunk
+      actions            <- flattened (chunk_size * orig_action_dim,) — full prediction target
+      rewards            <- sum of rewards over exec_horizon steps
+      masks              <- mask at step exec_horizon
+      dones              <- done flag at step exec_horizon
+      next_observations  <- obs after exec_horizon steps  (RL value horizon)
+    """
+    if chunk_size == 1:
+        return dataset_dict
+    if exec_horizon is None:
+        exec_horizon = chunk_size
+    assert 1 <= exec_horizon <= chunk_size, (
+        f"exec_horizon={exec_horizon} must be in [1, chunk_size={chunk_size}]"
+    )
+
+    dones = dataset_dict["dones"]
+    N = len(dones)
+
+    # Valid-start: no episode boundary in first chunk_size-1 steps so the full action
+    # prediction sequence is drawn from a single episode.
+    done_cumsum = np.concatenate([[0], np.cumsum(dones)])
+    t_range = np.arange(N - chunk_size + 1, dtype=np.int64)
+    mid_done_sums = done_cumsum[t_range + chunk_size - 1] - done_cumsum[t_range]
+    valid_starts = t_range[mid_done_sums == 0]
+
+    # Full action sequence: (n_chunks, chunk_size) → flattened
+    action_indices = valid_starts[:, None] + np.arange(chunk_size, dtype=np.int64)[None, :]
+    chunk_actions = dataset_dict["actions"][action_indices].reshape(len(valid_starts), -1).astype(np.float32)
+
+    # RL value horizon: exec_horizon steps
+    exec_indices = valid_starts[:, None] + np.arange(exec_horizon, dtype=np.int64)[None, :]
+    chunk_rewards = dataset_dict["rewards"][exec_indices].sum(axis=1).astype(np.float32)
+    ends = valid_starts + exec_horizon - 1   # last executed step index
+
+    obs = dataset_dict["observations"]
+    next_obs = dataset_dict["next_observations"]
+    if isinstance(obs, dict):
+        chunk_obs = {k: v[valid_starts] for k, v in obs.items()}
+        chunk_next_obs = {k: v[ends] for k, v in next_obs.items()}
+    else:
+        chunk_obs = obs[valid_starts]
+        chunk_next_obs = next_obs[ends]
+
+    return {
+        "observations": chunk_obs,
+        "actions": chunk_actions,
+        "rewards": chunk_rewards,
+        "masks": dataset_dict["masks"][ends].astype(np.float32),
+        "dones": dataset_dict["dones"][ends].astype(np.float32),
+        "next_observations": chunk_next_obs,
+    }
+
+
 class RoboD4RLDataset(Dataset):
     def __init__(self, env, clip_to_eps=True, eps=1e-5, num_data=0, ignore_done=False, custom_dataset=None):
         assert custom_dataset is not None, "Public release RoboD4RLDataset only supports custom_dataset input."

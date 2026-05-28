@@ -16,6 +16,7 @@ from faster.agents.agent import Agent
 from faster.agents.temperature import Temperature
 from faster.data.dataset import DatasetDict
 from faster.distributions import TanhNormal
+from faster.networks.resnet import ImageStateEncoder, get_resnet18
 from faster.networks import (
     DDPM,
     MLP,
@@ -39,6 +40,91 @@ def decay_mask_fn(params):
     return flax.core.FrozenDict(flax.traverse_util.unflatten_dict(flat_mask))
 
 
+def _load_pretrained_resnet18_conv_weights(params, in_channels=3):
+    """Replace conv kernels in any img_encoder within params with ImageNet pretrained weights.
+
+    GroupNorm params are left at their random init values (they adapt during fine-tuning).
+    For in_channels != 3: first conv weights are adapted by averaging over the 3 input
+    channels and tiling, preserving the pretrained filter magnitudes.
+    """
+    try:
+        import torch
+        from torchvision.models import resnet18, ResNet18_Weights
+        pt = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1).state_dict()
+    except Exception as e:
+        print(f"[pretrained_encoder] skipping: {e}")
+        return params
+
+    def pt_conv(t):
+        """PyTorch (out,in,H,W) → JAX/Flax (H,W,in,out)."""
+        return jnp.array(t.detach().cpu().float().numpy().transpose(2, 3, 1, 0))
+
+    def adapt_first_conv(t, in_ch):
+        """Average 3-ch pretrained weights across channels, tile to in_ch."""
+        w = t.detach().cpu().float().numpy()  # (64, 3, 7, 7)
+        w_avg = w.mean(axis=1, keepdims=True)  # (64, 1, 7, 7)
+        w_tiled = np.tile(w_avg, (1, in_ch, 1, 1))  # (64, in_ch, 7, 7)
+        return jnp.array(w_tiled.transpose(2, 3, 1, 0))  # (7, 7, in_ch, 64)
+
+    # Maps PyTorch key → suffix path within "img_encoder/..."
+    MAPPING = {
+        "conv1.weight":                 "img_encoder/conv_init/kernel",
+        "layer1.0.conv1.weight":        "img_encoder/ResNetBlock_0/Conv_0/kernel",
+        "layer1.0.conv2.weight":        "img_encoder/ResNetBlock_0/Conv_1/kernel",
+        "layer1.1.conv1.weight":        "img_encoder/ResNetBlock_1/Conv_0/kernel",
+        "layer1.1.conv2.weight":        "img_encoder/ResNetBlock_1/Conv_1/kernel",
+        "layer2.0.conv1.weight":        "img_encoder/ResNetBlock_2/Conv_0/kernel",
+        "layer2.0.downsample.0.weight": "img_encoder/ResNetBlock_2/conv_proj/kernel",
+        "layer2.0.conv2.weight":        "img_encoder/ResNetBlock_2/Conv_1/kernel",
+        "layer2.1.conv1.weight":        "img_encoder/ResNetBlock_3/Conv_0/kernel",
+        "layer2.1.conv2.weight":        "img_encoder/ResNetBlock_3/Conv_1/kernel",
+        "layer3.0.conv1.weight":        "img_encoder/ResNetBlock_4/Conv_0/kernel",
+        "layer3.0.downsample.0.weight": "img_encoder/ResNetBlock_4/conv_proj/kernel",
+        "layer3.0.conv2.weight":        "img_encoder/ResNetBlock_4/Conv_1/kernel",
+        "layer3.1.conv1.weight":        "img_encoder/ResNetBlock_5/Conv_0/kernel",
+        "layer3.1.conv2.weight":        "img_encoder/ResNetBlock_5/Conv_1/kernel",
+        "layer4.0.conv1.weight":        "img_encoder/ResNetBlock_6/Conv_0/kernel",
+        "layer4.0.downsample.0.weight": "img_encoder/ResNetBlock_6/conv_proj/kernel",
+        "layer4.0.conv2.weight":        "img_encoder/ResNetBlock_6/Conv_1/kernel",
+        "layer4.1.conv1.weight":        "img_encoder/ResNetBlock_7/Conv_0/kernel",
+        "layer4.1.conv2.weight":        "img_encoder/ResNetBlock_7/Conv_1/kernel",
+    }
+
+    params_dict = flax.core.unfreeze(params) if isinstance(params, flax.core.FrozenDict) else dict(params)
+    flat = flax.traverse_util.flatten_dict(params_dict, sep="/")
+
+    loaded = 0
+    for pt_key, suffix in MAPPING.items():
+        if pt_key not in pt:
+            continue
+        for flat_key in list(flat.keys()):
+            if flat_key.endswith(suffix):
+                if pt_key == "conv1.weight":
+                    flat[flat_key] = adapt_first_conv(pt[pt_key], in_channels)
+                else:
+                    flat[flat_key] = pt_conv(pt[pt_key])
+                loaded += 1
+
+    print(f"[pretrained_encoder] loaded {loaded}/{len(MAPPING)} conv layers from ImageNet ResNet18")
+    return flax.traverse_util.unflatten_dict(flat, sep="/")
+
+
+def _make_split_encoder_tx(params, base_tx, encoder_lr=1e-5):
+    """Wrap base_tx so ImageStateEncoder_0 params use a fixed smaller encoder_lr."""
+    try:
+        params_dict = flax.core.unfreeze(params) if isinstance(params, flax.core.FrozenDict) else dict(params)
+        flat = flax.traverse_util.flatten_dict(params_dict, sep="/")
+        labels = {k: ("encoder" if "ImageStateEncoder_0" in k else "model") for k in flat}
+        label_tree = flax.traverse_util.unflatten_dict(labels, sep="/")
+        return optax.multi_transform(
+            transforms={"encoder": optax.adamw(encoder_lr), "model": base_tx},
+            param_labels=label_tree,
+        )
+    except Exception as e:
+        print(f"[split_encoder_tx] fallback to base_tx: {e}")
+        return base_tx
+
+
 @partial(jax.jit, static_argnames=("critic_fn",))
 def compute_q(critic_fn, critic_params, observations, actions):
     q_values = critic_fn({"params": critic_params}, observations, actions)
@@ -58,18 +144,20 @@ def _sample_actions_jit(agent, observations):
     observations = jax.tree_map(lambda x: jnp.squeeze(x), observations)
     observations = jax.tree_map(lambda x: jnp.expand_dims(x, axis=0) if x.ndim == 1 or x.ndim == 3 else x, observations)
 
+    # B+A: encode once; pass flat obs to samplers — DDPM uses else: s_encoded=s, no internal encoder call
+    obs_enc = agent._get_obs_encoding(observations, agent.target_actor.params)
+
     actor_params = agent.target_actor.params
     if agent.filter_enabled and agent.filter_at_eval:
-        actions, _, rng = agent._sample_candidates(rng, observations, agent.N, actor_params, agent.filter_temperature_train)
+        actions, _, rng = agent._sample_candidates(rng, obs_enc, agent.N, actor_params, agent.filter_temperature_train)
     else:
-        observations_repeated = observations
         actions, rng = ddim_sampler(
             agent.actor.apply_fn,
             actor_params,
             agent.T,
             rng,
             agent.action_dim,
-            observations_repeated,
+            obs_enc,
             agent.alphas,
             agent.alpha_hats,
             agent.betas,
@@ -83,17 +171,63 @@ def _sample_actions_jit(agent, observations):
     if diffusion_actions.shape[0] > 1 or agent.ne_samples > 0:
         key, rng = jax.random.split(rng)
         target_params = subsample_ensemble(key, agent.target_critic.params, agent.num_min_qs, agent.num_qs)
-        obs_rep = observations
+        obs_rep = obs_enc  # critic receives encoded obs
         all_actions = diffusion_actions
 
         if agent.ne_samples > 0:
             key, rng = jax.random.split(rng)
             d_actions = diffusion_actions[: agent.ne_samples]
-            r_obs = observations
+            r_obs = observations  # raw obs for edit_actor (its own encoder)
             r_samples, rng = _sample_actions(key, agent.edit_actor.apply_fn, agent.edit_actor.params, r_obs, d_actions)
             r_samples = agent._apply_residual_action_mask(r_samples * agent.r_action_scale) + d_actions
             r_samples = jnp.clip(r_samples, -1.0, 1.0)
-            obs_rep = jax.tree_map(lambda x, y: jnp.concatenate([x, y], axis=0), obs_rep, r_obs)
+            obs_rep = jnp.concatenate([obs_enc, obs_enc], axis=0)  # critic: encoded for both
+            all_actions = jnp.concatenate([all_actions, r_samples], axis=0)
+
+        qs = compute_q(agent.target_critic.apply_fn, target_params, obs_rep, all_actions)
+        idx = jnp.argmax(qs)
+        action = all_actions[idx]
+    else:
+        action = diffusion_actions[0]
+
+    rng, _ = jax.random.split(rng)
+    return action, rng
+
+
+@jax.jit
+def _eval_actions_jit(agent, observations):
+    """JIT-compiled eval path using filter_temperature_eval (deterministic) vs train temp."""
+    rng = agent.rng
+    observations = jax.tree_map(lambda x: jnp.squeeze(x), observations)
+    observations = jax.tree_map(lambda x: jnp.expand_dims(x, axis=0) if x.ndim == 1 or x.ndim == 3 else x, observations)
+
+    obs_enc = agent._get_obs_encoding(observations, agent.target_actor.params)
+    actor_params = agent.target_actor.params
+
+    if agent.filter_enabled and agent.filter_at_eval:
+        actions, _, rng = agent._sample_candidates(rng, obs_enc, agent.N, actor_params, agent.filter_temperature_eval)
+    else:
+        actions, rng = ddim_sampler(
+            agent.actor.apply_fn, actor_params, agent.T, rng, agent.action_dim,
+            obs_enc, agent.alphas, agent.alpha_hats, agent.betas, agent.M, eta=agent.ddim_eta,
+        )
+        actions = actions.reshape(1, agent.N, -1)
+
+    diffusion_actions = actions.squeeze(axis=0)
+
+    if diffusion_actions.shape[0] > 1 or agent.ne_samples > 0:
+        key, rng = jax.random.split(rng)
+        target_params = subsample_ensemble(key, agent.target_critic.params, agent.num_min_qs, agent.num_qs)
+        obs_rep = obs_enc
+        all_actions = diffusion_actions
+
+        if agent.ne_samples > 0:
+            key, rng = jax.random.split(rng)
+            d_actions = diffusion_actions[: agent.ne_samples]
+            r_samples, rng = _sample_actions(key, agent.edit_actor.apply_fn, agent.edit_actor.params, observations, d_actions)
+            r_samples = agent._apply_residual_action_mask(r_samples * agent.r_action_scale) + d_actions
+            r_samples = jnp.clip(r_samples, -1.0, 1.0)
+            obs_rep = jnp.concatenate([obs_enc, obs_enc], axis=0)
             all_actions = jnp.concatenate([all_actions, r_samples], axis=0)
 
         qs = compute_q(agent.target_critic.apply_fn, target_params, obs_rep, all_actions)
@@ -340,6 +474,45 @@ class FasterEXPOLearner(Agent):
     num_min_qs: Optional[int] = struct.field(pytree_node=False)
     filter_num_min_qs: Optional[int] = struct.field(pytree_node=False)
 
+    def _get_obs_encoding(self, observations, actor_params):
+        """Encode observations using the actor's shared image encoder (B).
+        Returns flat encoded features for image obs, or raw observations for low-dim.
+        Safe to call inside jax.jit.
+        """
+        if not (isinstance(observations, dict) and "image" in observations):
+            return observations
+        if "ImageStateEncoder_0" not in actor_params:
+            return observations
+        return ImageStateEncoder(encoder_cls=get_resnet18).apply(
+            {"params": actor_params["ImageStateEncoder_0"]},
+            observations,
+            training=False,
+        )
+
+    def _get_obs_encoding_chunked(self, observations, actor_params, n_chunks):
+        """Encode a large batch in n_chunks sequential chunks via lax.map.
+        Peak GPU memory = 1 chunk instead of the full batch.
+        Falls back to _get_obs_encoding for non-image / low-dim obs.
+        n_chunks=1: skip lax.map entirely, single direct pass.
+        """
+        if not (isinstance(observations, dict) and "image" in observations):
+            return observations
+        if "ImageStateEncoder_0" not in actor_params:
+            return observations
+        if n_chunks == 1:
+            return self._get_obs_encoding(observations, actor_params)
+        encoder_params = actor_params["ImageStateEncoder_0"]
+        total = jax.tree_util.tree_leaves(observations)[0].shape[0]
+        chunk_size = total // n_chunks
+        obs_chunks = jax.tree_map(lambda x: x.reshape(n_chunks, chunk_size, *x.shape[1:]), observations)
+        enc_chunks = jax.lax.map(
+            lambda obs_chunk: ImageStateEncoder(encoder_cls=get_resnet18).apply(
+                {"params": encoder_params}, obs_chunk, training=False
+            ),
+            obs_chunks,
+        )
+        return enc_chunks.reshape(total, -1)
+
     @classmethod
     def create(
         cls,
@@ -442,10 +615,26 @@ class FasterEXPOLearner(Agent):
         observations = jax.tree_map(lambda x: jnp.expand_dims(jnp.asarray(x), axis=0), observations)
         actions = jax.tree_map(lambda x: jnp.expand_dims(jnp.asarray(x), axis=0), actions)
         actor_params = actor_def.init(actor_key, observations, actions, time)["params"]
-        actor = TrainState.create(apply_fn=actor_def.apply, params=actor_params, tx=optax.adamw(learning_rate=actor_lr))
+        _is_image = isinstance(observations, dict) and "image" in observations and "ImageStateEncoder_0" in actor_params
+        if _is_image:
+            _in_ch = int(jnp.asarray(observations["image"]).shape[-1])
+            actor_params = _load_pretrained_resnet18_conv_weights(actor_params, _in_ch)
+            actor_tx = _make_split_encoder_tx(actor_params, optax.adamw(learning_rate=actor_lr))
+        else:
+            actor_tx = optax.adamw(learning_rate=actor_lr)
+        actor = TrainState.create(apply_fn=actor_def.apply, params=actor_params, tx=actor_tx)
         target_actor = TrainState.create(
             apply_fn=actor_def.apply, params=actor_params, tx=optax.GradientTransformation(lambda _: None, lambda _: None)
         )
+
+        # B: encode example obs using actor's encoder so critic/filter are initialized with flat
+        # features — they never build their own ImageStateEncoder params.
+        if isinstance(observations, dict) and "image" in observations and "ImageStateEncoder_0" in actor_params:
+            example_obs_enc = ImageStateEncoder(encoder_cls=get_resnet18).apply(
+                {"params": actor_params["ImageStateEncoder_0"]}, observations, training=False
+            )
+        else:
+            example_obs_enc = observations
 
         if beta_schedule == "cosine":
             betas = jnp.array(cosine_beta_schedule(T))
@@ -463,7 +652,12 @@ class FasterEXPOLearner(Agent):
         edit_actor_base_cls = partial(StateActionEncoder, base_cls=edit_actor_base_cls)
         edit_actor_def = TanhNormal(edit_actor_base_cls, action_dim)
         edit_actor_params = edit_actor_def.init(actor_key, observations, jnp.ones((1, action_dim)))["params"]
-        edit_actor = TrainState.create(apply_fn=edit_actor_def.apply, params=edit_actor_params, tx=optax.adam(learning_rate=actor_lr))
+        if _is_image:
+            edit_actor_params = _load_pretrained_resnet18_conv_weights(edit_actor_params, _in_ch)
+            edit_actor_tx = _make_split_encoder_tx(edit_actor_params, optax.adam(learning_rate=actor_lr))
+        else:
+            edit_actor_tx = optax.adam(learning_rate=actor_lr)
+        edit_actor = TrainState.create(apply_fn=edit_actor_def.apply, params=edit_actor_params, tx=edit_actor_tx)
 
         def make_critic_base_cls(critic_hidden_dims_):
             if use_critic_resnet:
@@ -491,7 +685,7 @@ class FasterEXPOLearner(Agent):
         outer_critic_cls = make_outer_critic_cls(outer_critic_hidden_dims)
         filter_critic_cls = make_filter_critic_cls(filter_critic_hidden_dims)
         critic_def = Ensemble(outer_critic_cls, num=num_qs)
-        critic_params = critic_def.init(critic_key, observations, actions)["params"]
+        critic_params = critic_def.init(critic_key, example_obs_enc, actions)["params"]
         if critic_weight_decay is not None:
             tx = optax.adamw(learning_rate=critic_lr, weight_decay=critic_weight_decay, mask=decay_mask_fn)
         else:
@@ -520,7 +714,7 @@ class FasterEXPOLearner(Agent):
 
             rng, hidden_key = jax.random.split(rng)
             hidden_def = Ensemble(filter_critic_cls, num=num_qs)
-            hidden_params = hidden_def.init(hidden_key, observations, actions, time)["params"]
+            hidden_params = hidden_def.init(hidden_key, example_obs_enc, actions, time)["params"]
             filter_critic = TrainState.create(apply_fn=hidden_def.apply, params=hidden_params, tx=optax.adam(learning_rate=critic_lr))
             target_hidden_def = Ensemble(filter_critic_cls, num=target_filter_num_qs)
             target_filter_critic = TrainState.create(
@@ -566,18 +760,20 @@ class FasterEXPOLearner(Agent):
 
     def _sample_candidates(self, rng, observations, N, actor_params, filter_temperature):
         observations = jax.tree_map(lambda x: jax.device_put(jnp.asarray(x)), observations)
-        observatiogns = jax.tree_map(lambda x: x[None, :] if x.ndim == 1 else x, observations)
         batch_size = jax.tree_util.tree_leaves(observations)[0].shape[0]
 
         if not self.filter_enabled:
-            observations_repeated = observations
+            obs_rep = jax.tree_map(
+                lambda x: jnp.broadcast_to(x[:, None, ...], (batch_size, N, *x.shape[1:])).reshape(-1, *x.shape[1:]),
+                observations,
+            )
             actions_flat, rng = ddim_sampler(
                 self.actor.apply_fn,
                 actor_params,
                 self.T,
                 rng,
                 self.action_dim,
-                observations_repeated,
+                obs_rep,
                 self.alphas,
                 self.alpha_hats,
                 self.betas,
@@ -635,7 +831,7 @@ class FasterEXPOLearner(Agent):
         mask = jnp.asarray(self.residual_action_mask, dtype=residual_actions.dtype)
         return residual_actions * mask
 
-    def _select_best_actions(self, rng, observations, actions, target_params):
+    def _select_best_actions(self, rng, observations, actions, target_params, raw_observations=None):
         batch_size = jax.tree_util.tree_leaves(observations)[0].shape[0]
         num_candidates = actions.shape[1]
         total_candidates = num_candidates + self.ne_samples_train
@@ -644,7 +840,8 @@ class FasterEXPOLearner(Agent):
 
         if self.ne_samples_train > 0:
             key, rng = jax.random.split(rng)
-            r_observations = observations
+            # edit_actor uses raw obs (its own encoder) when available; falls back to encoded for low-dim
+            r_observations = raw_observations if raw_observations is not None else observations
             d_actions = actions[:, : self.ne_samples_train].reshape(-1, actions.shape[-1])
             r_samples, rng = _sample_actions(key, self.edit_actor.apply_fn, self.edit_actor.params, r_observations, d_actions)
             r_samples = self._apply_residual_action_mask(r_samples * self.r_action_scale) + d_actions
@@ -668,65 +865,23 @@ class FasterEXPOLearner(Agent):
         return best_actions, best_q, best_indices, rng
 
     def eval_actions(self, observations):
-        rng = self.rng
-        
-        # Safely add batch dimension if missing (1D for state, 3D for image)
-        observations = jax.tree_map(lambda x: jnp.expand_dims(x, axis=0) if jnp.asarray(x).ndim in (1, 3) else jnp.asarray(x), observations)
-        observations = jax.device_put(observations)
-
-        actor_params = self.target_actor.params
-        if self.filter_enabled and self.filter_at_eval:
-            actions, _, rng = self._sample_candidates(rng, observations, self.N, actor_params, self.filter_temperature_eval)
-        else:
-            observations_repeated = observations
-            actions, rng = ddim_sampler(
-                self.actor.apply_fn,
-                actor_params,
-                self.T,
-                rng,
-                self.action_dim,
-                observations_repeated,
-                self.alphas,
-                self.alpha_hats,
-                self.betas,
-                self.M,
-                eta=self.ddim_eta,
-            )
-            actions = actions.reshape(1, self.N, -1)
-
-        diffusion_actions = actions.squeeze(axis=0)
-
-        if diffusion_actions.shape[0] > 1 or self.ne_samples > 0:
-            key, rng = jax.random.split(rng)
-            target_params = subsample_ensemble(key, self.target_critic.params, self.num_min_qs, self.num_qs)
-            obs_rep = observations
-            all_actions = diffusion_actions
-
-            if self.ne_samples > 0:
-                key, rng = jax.random.split(rng)
-                d_actions = diffusion_actions[: self.ne_samples]
-                r_obs = observations
-                r_samples, rng = _sample_actions(key, self.edit_actor.apply_fn, self.edit_actor.params, r_obs, d_actions)
-                r_samples = self._apply_residual_action_mask(r_samples * self.r_action_scale) + d_actions
-                r_samples = jnp.clip(r_samples, -1.0, 1.0)
-                obs_rep = jax.tree_map(lambda x, y: jnp.concatenate([x, y], axis=0), obs_rep, r_obs)
-                all_actions = jnp.concatenate([all_actions, r_samples], axis=0)
-
-            qs = compute_q(self.target_critic.apply_fn, target_params, obs_rep, all_actions)
-            idx = jnp.argmax(qs)
-            action = all_actions[idx]
-        else:
-            action = diffusion_actions[0]
-
-        rng, _ = jax.random.split(rng)
+        action, rng = _eval_actions_jit(self, observations)
         return np.array(action.squeeze()), self.replace(rng=rng)
 
     def sample_actions(self, observations):
         action, rng = _sample_actions_jit(self, observations)
         return np.array(action.squeeze()), self.replace(rng=rng)
 
-    @jax.jit
-    def update_edit_actor(self, batch: DatasetDict):
+    @partial(jax.jit, static_argnames=("has_critic_obs_enc",))
+    def update_edit_actor(self, batch: DatasetDict, critic_obs_enc=None, *, has_critic_obs_enc: bool = False):
+        # critic_obs_enc: pre-computed target-actor encoding passed from update() to avoid
+        # re-running ResNet18 here. has_critic_obs_enc is static so the two branches are
+        # compiled separately and no conditional on a traced value is needed.
+        if has_critic_obs_enc:
+            obs_enc = jax.lax.stop_gradient(critic_obs_enc)
+        else:
+            obs_enc = jax.lax.stop_gradient(self._get_obs_encoding(batch["observations"], self.target_actor.params))
+
         key, rng = jax.random.split(self.rng)
         key2, rng = jax.random.split(rng)
         dropout_key, rng = jax.random.split(rng)
@@ -739,7 +894,7 @@ class FasterEXPOLearner(Agent):
             log_probs = log_probs - actions.shape[-1] * jnp.log(self.r_action_scale)
             actions = actions + batch["actions"]
             actions = jnp.clip(actions, -1.0, 1.0)
-            qs = self.critic.apply_fn({"params": self.critic.params}, batch["observations"], actions, True, rngs={"dropout": key2})
+            qs = self.critic.apply_fn({"params": self.critic.params}, obs_enc, actions, True, rngs={"dropout": key2})
             q = qs.mean(axis=0)
             loss = (log_probs * self.temp.apply_fn({"params": self.temp.params}) - q).mean()
             return loss, {"edit_q": q.mean(), "edit_actor_loss": loss, "entropy": -log_probs.mean()}
@@ -789,13 +944,13 @@ class FasterEXPOLearner(Agent):
         return self.replace(temp=temp), temp_info
 
     @jax.jit
-    def update_critic_from_candidates(self, batch: DatasetDict, next_actions_candidates: jnp.ndarray, stored, rng):
+    def update_critic_from_candidates(self, batch: DatasetDict, next_actions_candidates: jnp.ndarray, stored, rng, raw_next_obs=None):
         next_obs = batch["next_observations"]
 
         key, rng = jax.random.split(rng)
         target_params = subsample_ensemble(key, self.target_critic.params, self.num_min_qs, self.num_qs)
 
-        next_actions, next_q, _, rng = self._select_best_actions(rng, next_obs, next_actions_candidates, target_params)
+        next_actions, next_q, _, rng = self._select_best_actions(rng, next_obs, next_actions_candidates, target_params, raw_observations=raw_next_obs)
         target_q = batch["rewards"] + self.discount * batch["masks"] * next_q
 
         key, rng = jax.random.split(rng)
@@ -860,15 +1015,19 @@ class FasterEXPOLearner(Agent):
         return agent, info
 
     @jax.jit
-    def update_critic(self, batch: DatasetDict):
+    def update_critic(self, batch: DatasetDict, raw_next_obs=None):
         rng = self.rng
-        next_obs = batch["next_observations"]
+        # _get_obs_encoding is a no-op when batch already contains flat encoded arrays
+        obs_enc = jax.lax.stop_gradient(self._get_obs_encoding(batch["observations"], self.target_actor.params))
+        next_obs_enc = jax.lax.stop_gradient(self._get_obs_encoding(batch["next_observations"], self.target_actor.params))
+        encoded_batch = {**batch, "observations": obs_enc, "next_observations": next_obs_enc}
 
         actor_params = self.actor.params
         next_actions_candidates, stored, rng = self._sample_candidates(
-            rng, next_obs, self.train_N, actor_params, self.filter_temperature_train
+            rng, next_obs_enc, self.train_N, actor_params, self.filter_temperature_train
         )
-        return self.update_critic_from_candidates(batch, next_actions_candidates, stored, rng)
+        _raw_next = batch["next_observations"] if raw_next_obs is None else raw_next_obs
+        return self.update_critic_from_candidates(encoded_batch, next_actions_candidates, stored, rng, raw_next_obs=_raw_next)
 
     @partial(jax.jit, static_argnames=("utd_ratio", "pretrain_q", "pretrain_r"))
     def update_offline(self, batch: DatasetDict, utd_ratio: int, pretrain_q: bool, pretrain_r: bool):
@@ -876,29 +1035,53 @@ class FasterEXPOLearner(Agent):
         assert jax.tree_util.tree_leaves(batch["observations"])[0].shape[0] % utd_ratio == 0
         mini_batch_size = jax.tree_util.tree_leaves(batch["observations"])[0].shape[0] // utd_ratio
 
+        n_enc_chunks = max(1, utd_ratio // 4)
+        obs_enc = jax.lax.stop_gradient(self._get_obs_encoding_chunked(batch["observations"], self.target_actor.params, n_enc_chunks))
+        next_obs_enc = jax.lax.stop_gradient(self._get_obs_encoding_chunked(batch["next_observations"], self.target_actor.params, n_enc_chunks))
+        encoded_batch = {**batch, "observations": obs_enc, "next_observations": next_obs_enc}
+
         def get_mini_batch(i):
             start = i * mini_batch_size
-            return jax.tree_util.tree_map(lambda x: jax.lax.dynamic_slice_in_dim(x, start, mini_batch_size, axis=0), batch)
+            return jax.tree_util.tree_map(lambda x: jax.lax.dynamic_slice_in_dim(x, start, mini_batch_size, axis=0), encoded_batch)
 
-        actor_batch = get_mini_batch(utd_ratio - 1)
+        raw_actor_batch = jax.tree_util.tree_map(
+            lambda x: jax.lax.dynamic_slice_in_dim(x, (utd_ratio - 1) * mini_batch_size, mini_batch_size, axis=0), batch
+        )
 
         new_agent = self
         critic_info = {}
         if pretrain_q:
+            # Pre-sample candidates once for full next_obs — actor params fixed during critic UTD loop
+            rng = self.rng
+            next_cands_full, stored_full, rng = self._sample_candidates(
+                rng, next_obs_enc, self.train_N, self.actor.params, self.filter_temperature_train
+            )
+            new_agent = self.replace(rng=rng)
+
+            def get_mini_candidates(i):
+                start = i * mini_batch_size
+                cands = jax.lax.dynamic_slice_in_dim(next_cands_full, start, mini_batch_size, axis=0)
+                stored = tuple(jax.lax.dynamic_slice_in_dim(s, start, mini_batch_size, axis=0) for s in stored_full)
+                return cands, stored
 
             def body(i, carry):
                 agent, _ = carry
-                mini_batch = get_mini_batch(i)
-                agent, info = agent.update_critic(mini_batch)
+                cands, stored = get_mini_candidates(i)
+                agent, info = agent.update_critic_from_candidates(
+                    get_mini_batch(i), cands, stored, agent.rng
+                )
                 return agent, info
 
-            mini_batch0 = get_mini_batch(0)
-            new_agent, critic_info = new_agent.update_critic(mini_batch0)
+            cands0, stored0 = get_mini_candidates(0)
+            new_agent, critic_info = new_agent.update_critic_from_candidates(
+                get_mini_batch(0), cands0, stored0, new_agent.rng
+            )
             new_agent, critic_info = jax.lax.fori_loop(1, utd_ratio, body, (new_agent, critic_info))
 
-        new_agent, actor_info = new_agent.update_actor(actor_batch)
+        new_agent, actor_info = new_agent.update_actor(raw_actor_batch)
         if pretrain_r and (self.ne_samples + self.ne_samples_train > 0):
-            new_agent, edit_info = new_agent.update_edit_actor(actor_batch)
+            actor_obs_enc = jax.lax.dynamic_slice_in_dim(obs_enc, (utd_ratio - 1) * mini_batch_size, mini_batch_size, axis=0)
+            new_agent, edit_info = new_agent.update_edit_actor(raw_actor_batch, actor_obs_enc, has_critic_obs_enc=True)
             new_agent, temp_info = new_agent.update_temperature(edit_info["entropy"])
             actor_info.update(edit_info)
             actor_info.update(temp_info)
@@ -911,25 +1094,50 @@ class FasterEXPOLearner(Agent):
         assert jax.tree_util.tree_leaves(batch["observations"])[0].shape[0] % utd_ratio == 0
         mini_batch_size = jax.tree_util.tree_leaves(batch["observations"])[0].shape[0] // utd_ratio
 
+        n_enc_chunks = max(1, utd_ratio // 4)
+        obs_enc = jax.lax.stop_gradient(self._get_obs_encoding_chunked(batch["observations"], self.target_actor.params, n_enc_chunks))
+        next_obs_enc = jax.lax.stop_gradient(self._get_obs_encoding_chunked(batch["next_observations"], self.target_actor.params, n_enc_chunks))
+        encoded_batch = {**batch, "observations": obs_enc, "next_observations": next_obs_enc}
+
         def get_mini_batch(i):
             start = i * mini_batch_size
-            return jax.tree_util.tree_map(lambda x: jax.lax.dynamic_slice_in_dim(x, start, mini_batch_size, axis=0), batch)
+            return jax.tree_util.tree_map(lambda x: jax.lax.dynamic_slice_in_dim(x, start, mini_batch_size, axis=0), encoded_batch)
 
-        mini_batch_last = get_mini_batch(utd_ratio - 1)
+        raw_edit_batch = jax.tree_util.tree_map(
+            lambda x: jax.lax.dynamic_slice_in_dim(x, (utd_ratio - 1) * mini_batch_size, mini_batch_size, axis=0), batch
+        )
+
+        # Pre-sample candidates once for full next_obs — actor params fixed during critic UTD loop
+        rng = self.rng
+        next_cands_full, stored_full, rng = self._sample_candidates(
+            rng, next_obs_enc, self.train_N, self.actor.params, self.filter_temperature_train
+        )
+        new_agent = self.replace(rng=rng)
+
+        def get_mini_candidates(i):
+            start = i * mini_batch_size
+            cands = jax.lax.dynamic_slice_in_dim(next_cands_full, start, mini_batch_size, axis=0)
+            stored = tuple(jax.lax.dynamic_slice_in_dim(s, start, mini_batch_size, axis=0) for s in stored_full)
+            return cands, stored
 
         def body(i, carry):
             agent, _ = carry
-            mini_batch = get_mini_batch(i)
-            agent, info = agent.update_critic(mini_batch)
+            cands, stored = get_mini_candidates(i)
+            agent, info = agent.update_critic_from_candidates(
+                get_mini_batch(i), cands, stored, agent.rng
+            )
             return agent, info
 
-        mini_batch0 = get_mini_batch(0)
-        new_agent, critic_info = self.update_critic(mini_batch0)
+        cands0, stored0 = get_mini_candidates(0)
+        new_agent, critic_info = new_agent.update_critic_from_candidates(
+            get_mini_batch(0), cands0, stored0, new_agent.rng
+        )
         new_agent, critic_info = jax.lax.fori_loop(1, utd_ratio, body, (new_agent, critic_info))
 
         new_agent, actor_info = new_agent.update_actor(actor_batch)
         if self.ne_samples + self.ne_samples_train > 0:
-            new_agent, edit_info = new_agent.update_edit_actor(mini_batch_last)
+            edit_obs_enc = jax.lax.dynamic_slice_in_dim(obs_enc, (utd_ratio - 1) * mini_batch_size, mini_batch_size, axis=0)
+            new_agent, edit_info = new_agent.update_edit_actor(raw_edit_batch, edit_obs_enc, has_critic_obs_enc=True)
             new_agent, temp_info = new_agent.update_temperature(edit_info["entropy"])
             actor_info.update(edit_info)
             actor_info.update(temp_info)
@@ -942,25 +1150,56 @@ class FasterEXPOLearner(Agent):
         assert jax.tree_util.tree_leaves(batch["observations"])[0].shape[0] % utd_ratio == 0
         mini_batch_size = jax.tree_util.tree_leaves(batch["observations"])[0].shape[0] // utd_ratio
 
+        # Encode full batch in sequential chunks (lax.map) to bound peak GPU memory.
+        # n_enc_chunks=max(1, utd_ratio//4) → chunk_size=4096 at utd=16 → ~80% GPU utilization
+        # vs n_enc_chunks=utd_ratio → chunk_size=1024 → ~30% GPU utilization + 32 loop overhead.
+        n_enc_chunks = max(1, utd_ratio // 4)
+        obs_enc = jax.lax.stop_gradient(self._get_obs_encoding_chunked(batch["observations"], self.target_actor.params, n_enc_chunks))
+        next_obs_enc = jax.lax.stop_gradient(self._get_obs_encoding_chunked(batch["next_observations"], self.target_actor.params, n_enc_chunks))
+        encoded_batch = {**batch, "observations": obs_enc, "next_observations": next_obs_enc}
+
         def get_mini_batch(i):
             start = i * mini_batch_size
-            return jax.tree_util.tree_map(lambda x: jax.lax.dynamic_slice_in_dim(x, start, mini_batch_size, axis=0), batch)
+            return jax.tree_util.tree_map(lambda x: jax.lax.dynamic_slice_in_dim(x, start, mini_batch_size, axis=0), encoded_batch)
 
-        mini_batch_last = get_mini_batch(utd_ratio - 1)
+        raw_actor_batch = jax.tree_util.tree_map(
+            lambda x: jax.lax.dynamic_slice_in_dim(x, (utd_ratio - 1) * mini_batch_size, mini_batch_size, axis=0), batch
+        )
+
+        # Pre-sample candidates once for full next_obs — actor params fixed during critic UTD loop
+        rng = self.rng
+        next_cands_full, stored_full, rng = self._sample_candidates(
+            rng, next_obs_enc, self.train_N, self.actor.params, self.filter_temperature_train
+        )
+        new_agent = self.replace(rng=rng)
+
+        def get_mini_candidates(i):
+            start = i * mini_batch_size
+            cands = jax.lax.dynamic_slice_in_dim(next_cands_full, start, mini_batch_size, axis=0)
+            stored = tuple(jax.lax.dynamic_slice_in_dim(s, start, mini_batch_size, axis=0) for s in stored_full)
+            return cands, stored
 
         def body(i, carry):
             agent, _ = carry
-            mini_batch = get_mini_batch(i)
-            agent, info = agent.update_critic(mini_batch)
+            cands, stored = get_mini_candidates(i)
+            # Pass encoded mini-batch only; edit_actor inside _select_best_actions uses
+            # encoded obs (no raw-image ResNet18 pass inside fori_loop).
+            agent, info = agent.update_critic_from_candidates(
+                get_mini_batch(i), cands, stored, agent.rng
+            )
             return agent, info
 
-        mini_batch0 = get_mini_batch(0)
-        new_agent, critic_info = self.update_critic(mini_batch0)
+        cands0, stored0 = get_mini_candidates(0)
+        new_agent, critic_info = new_agent.update_critic_from_candidates(
+            get_mini_batch(0), cands0, stored0, new_agent.rng
+        )
         new_agent, critic_info = jax.lax.fori_loop(1, utd_ratio, body, (new_agent, critic_info))
 
-        new_agent, actor_info = new_agent.update_actor(mini_batch_last)
+        new_agent, actor_info = new_agent.update_actor(raw_actor_batch)
         if self.ne_samples + self.ne_samples_train > 0:
-            new_agent, edit_info = new_agent.update_edit_actor(mini_batch_last)
+            # Reuse obs_enc slice already computed above; avoids a redundant ResNet18 pass.
+            actor_obs_enc = jax.lax.dynamic_slice_in_dim(obs_enc, (utd_ratio - 1) * mini_batch_size, mini_batch_size, axis=0)
+            new_agent, edit_info = new_agent.update_edit_actor(raw_actor_batch, actor_obs_enc, has_critic_obs_enc=True)
             new_agent, temp_info = new_agent.update_temperature(edit_info["entropy"])
             actor_info.update(edit_info)
             actor_info.update(temp_info)

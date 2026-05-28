@@ -54,11 +54,13 @@ class DDPM(nn.Module):
     obs_encoder_cls: Optional[Type[nn.Module]] = None
 
     @nn.compact
-    def __call__(self, s, a: jnp.ndarray, time: jnp.ndarray, training: bool = False):
+    def __call__(self, s, a: jnp.ndarray, time: jnp.ndarray, training: bool = False, obs_encoding=None):
         t_ff = self.time_preprocess_cls()(time)
         cond = self.cond_encoder_cls()(t_ff, training=training)
-        
-        if self.obs_encoder_cls is not None:
+
+        if obs_encoding is not None:
+            s_encoded = obs_encoding
+        elif self.obs_encoder_cls is not None:
             s_encoded = self.obs_encoder_cls()(s, training=training)
         elif isinstance(s, dict) and "image" in s:
             s_encoded = ImageStateEncoder(encoder_cls=get_resnet18)(s, training=training)
@@ -281,7 +283,7 @@ def ddpm_sampler(
     return action_0, rng
 
 
-@partial(jax.jit, static_argnames=("actor_apply_fn", "act_dim", "T", "training"))
+@partial(jax.jit, static_argnames=("actor_apply_fn", "act_dim", "T", "training", "eta"))
 def ddim_sampler(
     actor_apply_fn,
     actor_params,
@@ -296,6 +298,7 @@ def ddim_sampler(
     training=False,
     *,
     eta: float = 0.0,
+    obs_encoding=None,
 ):
     batch_size = jax.tree_util.tree_leaves(observations)[0].shape[0]
     init_key, rng = jax.random.split(rng)
@@ -303,32 +306,30 @@ def ddim_sampler(
 
     def step(current_x, time):
         input_time = jnp.full((current_x.shape[0], 1), time)
-        eps_pred = actor_apply_fn({"params": actor_params}, observations, current_x, input_time, training=training)
+        eps_pred = actor_apply_fn({"params": actor_params}, observations, current_x, input_time, training=training, obs_encoding=obs_encoding)
 
         alpha_hat_t = alpha_hats[time]
         sqrt_alpha_hat_t = jnp.sqrt(alpha_hat_t)
         sqrt_one_minus_alpha_hat_t = jnp.sqrt(1.0 - alpha_hat_t)
         x0_pred = (current_x - sqrt_one_minus_alpha_hat_t * eps_pred) / sqrt_alpha_hat_t
 
-        alpha_hat_prev = jax.lax.cond(time > 0, lambda t: alpha_hats[t - 1], lambda _: jnp.asarray(1.0, dtype=alpha_hat_t.dtype), time)
-        eta_ = jnp.asarray(eta, dtype=current_x.dtype)
+        # jnp.where is cheaper than lax.cond inside scan (avoids two-branch dispatch)
+        alpha_hat_prev = jnp.where(
+            time > 0,
+            alpha_hats[jnp.maximum(0, time - 1)],
+            jnp.asarray(1.0, dtype=alpha_hat_t.dtype),
+        )
 
-        def deterministic(_):
-            x_next = jnp.sqrt(alpha_hat_prev) * x0_pred + jnp.sqrt(1.0 - alpha_hat_prev) * eps_pred
-            return x_next
-
-        def stochastic(_):
-            sigma = eta_ * jnp.sqrt((1.0 - alpha_hat_prev) / (1.0 - alpha_hat_t) * (1.0 - alpha_hat_t / alpha_hat_prev))
+        # eta is static → branch resolved at trace time, dead branch never compiled
+        if eta == 0.0:
+            current_x = jnp.sqrt(alpha_hat_prev) * x0_pred + jnp.sqrt(1.0 - alpha_hat_prev) * eps_pred
+        else:
+            sigma = eta * jnp.sqrt((1.0 - alpha_hat_prev) / (1.0 - alpha_hat_t) * (1.0 - alpha_hat_t / alpha_hat_prev))
             z = jax.random.normal(jax.random.fold_in(noise_key, time), shape=current_x.shape)
-            noise = sigma * z
             eps_scale = jnp.sqrt(jnp.maximum(0.0, 1.0 - alpha_hat_prev - sigma**2))
-            x_next = jnp.sqrt(alpha_hat_prev) * x0_pred + eps_scale * eps_pred + noise
-            return x_next
-
-        current_x = jax.lax.cond(eta_ == 0.0, deterministic, stochastic, operand=None)
+            current_x = jnp.sqrt(alpha_hat_prev) * x0_pred + eps_scale * eps_pred + sigma * z
 
         current_x = jnp.clip(current_x, -1, 1)
-
         return current_x, ()
 
     current_x = jax.random.normal(init_key, (batch_size, act_dim))
@@ -446,9 +447,6 @@ class MultiHeadStateActionValue(nn.Module):
         # return jnp.squeeze(value, -1)
 
         return head_outputs
-
-
-default_init = nn.initializers.xavier_uniform
 
 
 class MLPResNetBlock(nn.Module):

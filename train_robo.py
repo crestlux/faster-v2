@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import jax
+import jax.numpy as jnp
 import inspect
 import json
 import os
@@ -7,6 +8,13 @@ import random
 import sys
 from datetime import datetime
 from pathlib import Path
+
+# Persistent XLA compilation cache — avoids recompiling on every new run.
+# First run with a new configuration (e.g. chunk_size=8) still compiles once,
+# but subsequent runs reuse the cached kernels.
+_JAX_CACHE_DIR = os.path.expanduser("~/.jax_cache")
+os.makedirs(_JAX_CACHE_DIR, exist_ok=True)
+jax.config.update("jax_compilation_cache_dir", _JAX_CACHE_DIR)
 
 import cloudpickle as pickle
 import numpy as np
@@ -18,7 +26,10 @@ from ml_collections import config_flags
 import wandb
 from faster.agents import EXPOLearner, FasterEXPOLearner, FasterIDQLLearner, IDQLLearner
 from faster.data import RoboReplayBuffer
-from faster.data.robomimic_datasets import ENV_TO_HORIZON_MAP, RoboD4RLDataset, get_robomimic_env
+from faster.data.dataset import Dataset
+from faster.data.replay_buffer import _device_put_numeric_leaves
+from faster.data.robomimic_datasets import ENV_TO_HORIZON_MAP, RoboD4RLDataset, get_robomimic_env, make_chunk_dataset
+from faster.evaluation import ActionChunkWrapper
 from faster.networks.evaluation_wandb_video import get_video_robomimic_env, maybe_evaluate_robo_with_wandb_video
 from faster.param_utils import print_agent_param_summary
 from faster.train_robo_env_utils import _resolve_robomimic_dataset_path
@@ -58,6 +69,9 @@ flags.DEFINE_integer("offline_eval_interval", 50000, "Eval interval.")
 flags.DEFINE_integer("batch_size", 256, "Mini batch size.")
 flags.DEFINE_integer("max_steps", int(1e6), "Number of training steps.")
 flags.DEFINE_integer("start_training", int(5e3), "Number of training steps to start training.")
+flags.DEFINE_string("resume_from", "", "Path to checkpoint .msgpack file to resume from.")
+flags.DEFINE_integer("resume_step", 0, "Training step to resume from (sets loop start; ignored if resume_from is empty).")
+flags.DEFINE_string("wandb_resume_id", "", "wandb run ID to resume (e.g. 9erdj4yo). When set with resume_from, logs continue in the same run.")
 flags.DEFINE_integer("num_data", 0, "Number of training steps to start training.")
 flags.DEFINE_string("dataset_dir", "ph", "dataset name.")
 flags.DEFINE_integer("pretrain_steps", 0, "Number of offline updates.")
@@ -72,6 +86,11 @@ flags.DEFINE_boolean("binary_include_bc", True, "Whether to include BC data in t
 flags.DEFINE_boolean("pretrain_r", True, "Whether to include BC data in the binary datasets.")
 flags.DEFINE_boolean("pretrain_q", True, "Whether to include BC data in the binary datasets.")
 flags.DEFINE_boolean("use_image_obs", False, "Use image observations.")
+flags.DEFINE_integer("chunk_size", 1, "Action chunk size. 1 = single-step (default). >1 applies ActionChunkWrapper and make_chunk_dataset.")
+flags.DEFINE_integer("exec_horizon", 0, "Temporal ensemble execution horizon. 0 = same as chunk_size (full open-loop chunk). "
+                     "1 <= exec_horizon < chunk_size enables receding-horizon control: policy predicts chunk_size actions "
+                     "but only executes the first exec_horizon before replanning. "
+                     "Replay buffer and offline dataset both use exec_horizon-step returns for the critic.")
 config_flags.DEFINE_config_file(
     "config", "faster/agents/faster_expo_learner.py", "File path to the training hyperparameter configuration.", lock_config=False
 )
@@ -89,6 +108,9 @@ def main(_):
         exp_name += "_image"
     else:
         exp_name += "_lowdim"
+    if FLAGS.chunk_size > 1:
+        _exec_horizon_name = FLAGS.exec_horizon if FLAGS.exec_horizon > 0 else FLAGS.chunk_size
+        exp_name += f"_ac{FLAGS.chunk_size}e{_exec_horizon_name}"
     exp_name += f"_{datetime.now().strftime('%Y%m%d_%H%M%S')}__s{FLAGS.seed}"
     if "SLURM_JOB_ID" in os.environ:
         exp_name += f"_id{os.environ['SLURM_JOB_ID']}"
@@ -99,6 +121,9 @@ def main(_):
         wandb_init_kwargs["group"] = FLAGS.wandb_run_group
     if FLAGS.wandb_entity is not None:
         wandb_init_kwargs["entity"] = FLAGS.wandb_entity
+    if FLAGS.wandb_resume_id:
+        wandb_init_kwargs["id"] = FLAGS.wandb_resume_id
+        wandb_init_kwargs["resume"] = "allow"
     run = wandb.init(**wandb_init_kwargs)
     if FLAGS.wandb_log_code:
         include_fn = _build_source_code_include_fn(code_root)
@@ -145,7 +170,28 @@ def main(_):
         dataset = _load_robomimic_dataset(dataset_path, use_image_obs=FLAGS.use_image_obs)
 
     ds = RoboD4RLDataset(env=None, num_data=FLAGS.num_data, custom_dataset=dataset)
-    
+
+    # Resolve exec_horizon: 0 means "same as chunk_size" (classic open-loop chunk).
+    _exec_horizon = FLAGS.exec_horizon if FLAGS.exec_horizon > 0 else FLAGS.chunk_size
+
+    if FLAGS.chunk_size > 1:
+        # Cache chunk datasets next to the source file to skip recomputation on reruns.
+        # Cache key includes exec_horizon because it changes next_observations / rewards.
+        _cache_suffix = f"_chunk{FLAGS.chunk_size}_exec{_exec_horizon}.pkl"
+        _cache_path = Path(str(dataset_path).replace(".hdf5", _cache_suffix))
+        if FLAGS.dataset_dir in {"", "ph", "mh"} and _cache_path.exists():
+            with open(_cache_path, "rb") as _f:
+                chunk_dict = pickle.load(_f)
+        else:
+            chunk_dict = make_chunk_dataset(ds.dataset_dict, FLAGS.chunk_size, exec_horizon=_exec_horizon)
+            if FLAGS.dataset_dir in {"", "ph", "mh"}:
+                with open(_cache_path, "wb") as _f:
+                    pickle.dump(chunk_dict, _f, protocol=4)
+        ds = Dataset(chunk_dict)
+        # Only inject chunk_size into config for models that support it.
+        if "chunk_size" in FLAGS.config:
+            FLAGS.config.chunk_size = FLAGS.chunk_size
+
     if FLAGS.use_image_obs:
         example_observation = {
             "state": ds.dataset_dict["observations"]["state"][0][np.newaxis],
@@ -153,10 +199,16 @@ def main(_):
         }
     else:
         example_observation = ds.dataset_dict["observations"][0][np.newaxis]
-    
+
+    # After make_chunk_dataset, actions are already (chunk_size * orig_action_dim,)
     example_action = ds.dataset_dict["actions"][0][np.newaxis]
-    env = get_robomimic_env(str(dataset_path), example_action, FLAGS.env_name, use_image_obs=FLAGS.use_image_obs)
-    eval_env = get_video_robomimic_env(str(dataset_path), example_action, FLAGS.env_name, render_offscreen=FLAGS.save_video, use_image_obs=FLAGS.use_image_obs)
+
+    _base_example_action = dataset["actions"][0][np.newaxis]
+    env = get_robomimic_env(str(dataset_path), _base_example_action, FLAGS.env_name, use_image_obs=FLAGS.use_image_obs)
+    eval_env = get_video_robomimic_env(str(dataset_path), _base_example_action, FLAGS.env_name, render_offscreen=FLAGS.save_video, use_image_obs=FLAGS.use_image_obs)
+    if FLAGS.chunk_size > 1:
+        env = ActionChunkWrapper(env, FLAGS.chunk_size, exec_horizon=_exec_horizon)
+        eval_env = ActionChunkWrapper(eval_env, FLAGS.chunk_size, exec_horizon=_exec_horizon)
     max_traj_len = ENV_TO_HORIZON_MAP[FLAGS.env_name]
 
     ds.seed(FLAGS.seed)
@@ -176,6 +228,22 @@ def main(_):
         agent = create_fn(FLAGS.seed, jax.tree_map(lambda x: x.squeeze(), example_observation), example_action.squeeze(), **kwargs)
     print_agent_param_summary(agent)
 
+    if FLAGS.resume_from:
+        import flax
+        print(f"[resume] Loading checkpoint from {FLAGS.resume_from} ...", flush=True)
+        with open(FLAGS.resume_from, "rb") as f:
+            agent = flax.serialization.from_bytes(agent, f.read())
+        print(f"[resume] Done. Resuming from step {FLAGS.resume_step}.", flush=True)
+
+    # Warm-up _eval_actions_jit now so the first eval doesn't cause a multi-minute freeze.
+    # eval_actions uses a separate JIT compilation from sample_actions (different
+    # filter_temperature: eval=0.0 deterministic vs train=1.0 stochastic).
+    if FLAGS.use_image_obs:
+        print("[warmup] Compiling eval JIT (_eval_actions_jit)...", flush=True)
+        _warmup_obs = jax.tree_map(lambda x: jnp.asarray(x.squeeze()), example_observation)
+        agent.eval_actions(_warmup_obs)
+        print("[warmup] Done.", flush=True)
+
     replay_buffer = RoboReplayBuffer(jax.tree_map(lambda x: x.squeeze(), example_observation), example_action.squeeze(), FLAGS.max_steps)
     replay_buffer.seed(FLAGS.seed)
 
@@ -189,7 +257,8 @@ def main(_):
             batch[k] = v
             if "antmaze" in FLAGS.env_name and k == "rewards":
                 batch[k] -= 1
-
+        # Trigger async GPU transfer before JIT dispatch so data arrives in parallel
+        batch = _device_put_numeric_leaves(batch)
         agent, update_info = agent.update_offline(batch, FLAGS.utd_ratio, FLAGS.pretrain_q, FLAGS.pretrain_r)
 
         if i % FLAGS.log_interval == 0:
@@ -212,8 +281,29 @@ def main(_):
                 wandb.log({f"offline-evaluation/{k}": v}, step=i)
                 eval_logger.log({"event": "offline-evaluation", "metric": k, "value": v}, step=i)
 
+    _start_step = FLAGS.resume_step if FLAGS.resume_from else 0
+
+    # When resuming, refill the replay buffer before the main loop.
+    # These env steps are not counted toward max_steps or logged to wandb.
+    if FLAGS.resume_from:
+        _buf_n = FLAGS.start_training
+        print(f"[resume] Refilling replay buffer ({_buf_n} steps, not counted toward max_steps) ...", flush=True)
+        _buf_obs, _buf_done = env.reset(), False
+        for _ in tqdm.tqdm(range(_buf_n), desc="buffer warmup", dynamic_ncols=True):
+            _buf_action, agent = _sample_action(agent, _buf_obs)
+            _buf_next_obs, _buf_reward, _buf_done, _buf_info = env.step(_buf_action)
+            _buf_mask = 1.0 if not _buf_done or "TimeLimit.truncated" in (_buf_info or {}) else 0.0
+            replay_buffer.insert(dict(
+                observations=_buf_obs, actions=_buf_action, rewards=_buf_reward,
+                masks=_buf_mask, dones=_buf_done, next_observations=_buf_next_obs,
+            ))
+            _buf_obs = _buf_next_obs
+            if _buf_done:
+                _buf_obs, _buf_done = env.reset(), False
+        print(f"[resume] Buffer ready ({replay_buffer._size} transitions).", flush=True)
+
     observation, done = env.reset(), False
-    for i in tqdm.tqdm(range(0, FLAGS.max_steps + 1), smoothing=0.1, disable=not FLAGS.tqdm, dynamic_ncols=True, leave=False):
+    for i in tqdm.tqdm(range(_start_step, FLAGS.max_steps + 1), smoothing=0.1, disable=not FLAGS.tqdm, dynamic_ncols=True, leave=False):
         if i < FLAGS.start_training:
             action = rng.uniform(-1, 1, size=(example_action.shape[1],))
         else:
@@ -243,13 +333,14 @@ def main(_):
 
             if FLAGS.offline_ratio == 0.5:
                 batch = combine_half(offline_batch, online_batch, rng)
-
             else:
                 batch = combine(offline_batch, online_batch, rng)
 
             if "antmaze" in FLAGS.env_name:
                 batch["rewards"] -= 1
 
+            # Trigger async GPU transfer before JIT dispatch
+            batch = _device_put_numeric_leaves(batch)
             agent, update_info = agent.update(batch, FLAGS.utd_ratio)
 
             if i % FLAGS.log_interval == 0:

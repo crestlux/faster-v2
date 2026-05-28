@@ -13,7 +13,8 @@ source .env && python train_robo.py \
   --checkpoint_model=True \
   --eval_interval=5000 \
   --eval_episodes=20 \
-  --chunk_size=1
-  # Temporal ensemble: set exec_horizon < chunk_size to replan before executing all chunk actions.
-  # Example: --chunk_size=10 --exec_horizon=3  (predict 10, execute 3, replan)
-  # exec_horizon=0 means use chunk_size (default, no temporal ensemble effect)
+  --chunk_size=8 \
+  --exec_horizon=4 \
+  --resume_from=exp/square_ph_image_ac8e4_20260528_203952__s42/checkpoints/checkpoint_10000.msgpack \
+  --resume_step=10000 \
+  --wandb_resume_id=9erdj4yo
