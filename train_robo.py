@@ -86,11 +86,19 @@ flags.DEFINE_boolean("binary_include_bc", True, "Whether to include BC data in t
 flags.DEFINE_boolean("pretrain_r", True, "Whether to include BC data in the binary datasets.")
 flags.DEFINE_boolean("pretrain_q", True, "Whether to include BC data in the binary datasets.")
 flags.DEFINE_boolean("use_image_obs", False, "Use image observations.")
+flags.DEFINE_string("run_tag", "", "Short descriptive tag appended to wandb run name before the timestamp. "
+                    "Use to distinguish ablation conditions, e.g. 'ne8_utd8' or 'codefix'.")
 flags.DEFINE_integer("chunk_size", 1, "Action chunk size. 1 = single-step (default). >1 applies ActionChunkWrapper and make_chunk_dataset.")
 flags.DEFINE_integer("exec_horizon", 0, "Temporal ensemble execution horizon. 0 = same as chunk_size (full open-loop chunk). "
                      "1 <= exec_horizon < chunk_size enables receding-horizon control: policy predicts chunk_size actions "
                      "but only executes the first exec_horizon before replanning. "
                      "Replay buffer and offline dataset both use exec_horizon-step returns for the critic.")
+flags.DEFINE_boolean("share_encoder", False, "Share actor image encoder with critic/value/filter (stop_gradient). "
+                     "False (default) gives each network its own encoder trained via TD gradient (paper design).")
+flags.DEFINE_integer("state_proj_dim", 0, "Project proprioception to this dim before concat with image features. "
+                     "0 = no projection (default). 64 matches the paper's design.")
+flags.DEFINE_boolean("augment_obs", False, "Apply random crop+resize+color jitter during training (paper style). "
+                     "No-op for low-dim obs. Default False.")
 config_flags.DEFINE_config_file(
     "config", "faster/agents/faster_expo_learner.py", "File path to the training hyperparameter configuration.", lock_config=False
 )
@@ -111,6 +119,8 @@ def main(_):
     if FLAGS.chunk_size > 1:
         _exec_horizon_name = FLAGS.exec_horizon if FLAGS.exec_horizon > 0 else FLAGS.chunk_size
         exp_name += f"_ac{FLAGS.chunk_size}e{_exec_horizon_name}"
+    if FLAGS.run_tag:
+        exp_name += f"_{FLAGS.run_tag}"
     exp_name += f"_{datetime.now().strftime('%Y%m%d_%H%M%S')}__s{FLAGS.seed}"
     if "SLURM_JOB_ID" in os.environ:
         exp_name += f"_id{os.environ['SLURM_JOB_ID']}"
@@ -191,6 +201,12 @@ def main(_):
         # Only inject chunk_size into config for models that support it.
         if "chunk_size" in FLAGS.config:
             FLAGS.config.chunk_size = FLAGS.chunk_size
+    if "share_encoder" in FLAGS.config:
+        FLAGS.config.share_encoder = FLAGS.share_encoder
+    if "state_proj_dim" in FLAGS.config:
+        FLAGS.config.state_proj_dim = FLAGS.state_proj_dim
+    if "augment" in FLAGS.config:
+        FLAGS.config.augment = FLAGS.augment_obs
 
     if FLAGS.use_image_obs:
         example_observation = {
@@ -218,6 +234,11 @@ def main(_):
     assert model_cls in MODEL_REGISTRY, f"Unsupported model_cls={model_cls!r}. Supported model classes: {sorted(MODEL_REGISTRY)}"
     create_fn = MODEL_REGISTRY[model_cls].create
     create_sig = inspect.signature(create_fn)
+    # Pass exec_horizon and chunk_size for EXPO-FT style critic_action_dim computation.
+    if "exec_horizon" in create_sig.parameters:
+        kwargs.setdefault("exec_horizon", _exec_horizon)
+    if "chunk_size" in create_sig.parameters:
+        kwargs.setdefault("chunk_size", FLAGS.chunk_size)
     if "states" in create_sig.parameters and "states" not in kwargs:
         if "states" in ds.dataset_dict:
             state_input = ds.dataset_dict["states"][0][np.newaxis]

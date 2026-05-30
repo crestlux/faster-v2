@@ -265,40 +265,60 @@ def make_chunk_dataset(dataset_dict: dict, chunk_size: int, exec_horizon: int = 
         f"exec_horizon={exec_horizon} must be in [1, chunk_size={chunk_size}]"
     )
 
-    dones = dataset_dict["dones"]
+    dones = np.asarray(dataset_dict["dones"]).astype(np.float32)
+    rewards = np.asarray(dataset_dict["rewards"]).astype(np.float32)
+    masks = np.asarray(dataset_dict["masks"]).astype(np.float32)
     N = len(dones)
 
-    # Valid-start: no episode boundary in first chunk_size-1 steps so the full action
-    # prediction sequence is drawn from a single episode.
-    done_cumsum = np.concatenate([[0], np.cumsum(dones)])
-    t_range = np.arange(N - chunk_size + 1, dtype=np.int64)
-    mid_done_sums = done_cumsum[t_range + chunk_size - 1] - done_cumsum[t_range]
-    valid_starts = t_range[mid_done_sums == 0]
+    # Episode boundary for every start t = the first terminal at or after t.
+    #
+    # The previous implementation dropped any chunk whose first (chunk_size-1) steps
+    # contained a `done`. Because robomimic's sparse reward (and the done flag) only
+    # fire on the *terminal* success step, that filter guaranteed the exec window
+    # [t, t+exec_horizon-1] never contained a terminal whenever exec_horizon < chunk_size.
+    # Result: EVERY reward / done / mask was filtered out -> chunk_rewards all 0,
+    # masks all 1, dones all 0 -> the Bellman target collapses to 0 and Q never learns.
+    #
+    # Fix: keep all starts and clamp both the action window and the exec window to the
+    # episode boundary. Terminal transitions (which carry the reward) are retained, and
+    # the reward/next_obs/done/mask are computed over what is actually executed — exactly
+    # matching the online ActionChunkWrapper (sum rewards, stop on done).
+    done_positions = np.where(dones > 0)[0]
+    if len(done_positions) == 0:
+        done_positions = np.array([N - 1], dtype=np.int64)
+    pos = np.clip(np.searchsorted(done_positions, np.arange(N), side="left"), 0, len(done_positions) - 1)
+    next_done = done_positions[pos]              # (N,) first terminal index >= t
 
-    # Full action sequence: (n_chunks, chunk_size) → flattened
-    action_indices = valid_starts[:, None] + np.arange(chunk_size, dtype=np.int64)[None, :]
-    chunk_actions = dataset_dict["actions"][action_indices].reshape(len(valid_starts), -1).astype(np.float32)
+    starts = np.arange(N, dtype=np.int64)
+    boundary = next_done[starts]                 # episode end for each start (never crosses it)
 
-    # RL value horizon: exec_horizon steps
-    exec_indices = valid_starts[:, None] + np.arange(exec_horizon, dtype=np.int64)[None, :]
-    chunk_rewards = dataset_dict["rewards"][exec_indices].sum(axis=1).astype(np.float32)
-    ends = valid_starts + exec_horizon - 1   # last executed step index
+    # Full action sequence: (N, chunk_size) → flattened. Indices past the episode
+    # boundary are clamped to it (action hold), so chunks never cross into another episode.
+    action_indices = np.minimum(starts[:, None] + np.arange(chunk_size, dtype=np.int64)[None, :], boundary[:, None])
+    chunk_actions = dataset_dict["actions"][action_indices].reshape(N, -1).astype(np.float32)
+
+    # RL value horizon: execute up to exec_horizon steps, stopping at the terminal.
+    exec_end = np.minimum(starts + exec_horizon - 1, boundary)   # last executed step index
+    rew_cumsum = np.concatenate([[0.0], np.cumsum(rewards)])
+    chunk_rewards = (rew_cumsum[exec_end + 1] - rew_cumsum[starts]).astype(np.float32)
+    chunk_masks = masks[exec_end].astype(np.float32)             # 0 iff a terminal was reached
+    chunk_dones = (boundary <= starts + exec_horizon - 1).astype(np.float32)
 
     obs = dataset_dict["observations"]
     next_obs = dataset_dict["next_observations"]
     if isinstance(obs, dict):
-        chunk_obs = {k: v[valid_starts] for k, v in obs.items()}
-        chunk_next_obs = {k: v[ends] for k, v in next_obs.items()}
+        chunk_obs = {k: v[starts] for k, v in obs.items()}
+        chunk_next_obs = {k: v[exec_end] for k, v in next_obs.items()}
     else:
-        chunk_obs = obs[valid_starts]
-        chunk_next_obs = next_obs[ends]
+        chunk_obs = obs[starts]
+        chunk_next_obs = next_obs[exec_end]
 
     return {
         "observations": chunk_obs,
         "actions": chunk_actions,
         "rewards": chunk_rewards,
-        "masks": dataset_dict["masks"][ends].astype(np.float32),
-        "dones": dataset_dict["dones"][ends].astype(np.float32),
+        "masks": chunk_masks,
+        "dones": chunk_dones,
         "next_observations": chunk_next_obs,
     }
 
