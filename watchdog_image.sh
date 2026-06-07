@@ -3,7 +3,7 @@
 #   GPU0 = spatial_softmax, GPU1 = gap (single-variable ablation).
 # Logs status every 5 min to logs/watchdog_image.log: offline/online step, recent eval
 # returns, NaN/Inf checks, OOM/crash detection, GPU memory, disk.
-cd /home/crestlux/faster_crestlux/faster_official || exit 1
+cd /home/crestlux/faster_crestlux/faster-v2 || exit 1
 mkdir -p logs
 ST=logs/watchdog_image.log
 log(){ echo "[$(date '+%m-%d %H:%M:%S')] $*" >> "$ST"; }

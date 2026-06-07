@@ -2,7 +2,7 @@
 # Quick live status of the two image-square runs. Use:
 #   bash status.sh            # one snapshot
 #   watch -n 30 bash status.sh # auto-refresh every 30s
-cd /home/crestlux/faster_crestlux/faster_official || exit 1
+cd /home/crestlux/faster_crestlux/faster-v2 || exit 1
 echo "==================== $(date '+%m-%d %H:%M:%S') ===================="
 for row in "GPU0 spatial_softmax /tmp/img_gpu0_pid" "GPU1 gap /tmp/img_gpu1_pid"; do
   set -- $row; gpu="$1"; pool="$2"; pidf="$3"

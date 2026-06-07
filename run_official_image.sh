@@ -18,8 +18,8 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export XLA_FLAGS="--xla_gpu_strict_conv_algorithm_picker=false"
 export WANDB_MODE=online
 export ROBOMIMIC_DATASETS_PATH=/home/crestlux/faster_crestlux/faster-v2/datasets/robomimic
-export PYTHONPATH=/home/crestlux/faster_crestlux/faster_official
-cd /home/crestlux/faster_crestlux/faster_official
+export PYTHONPATH=/home/crestlux/faster_crestlux/faster-v2
+cd /home/crestlux/faster_crestlux/faster-v2
 python train_robo.py \
   --env_name=square --dataset_dir=ph --config.model_cls=FasterEXPOLearner \
   --use_image_obs=True --vision_pool="$POOL" --state_proj_dim=64 --num_kp=32 --augment_obs=True \
