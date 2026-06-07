@@ -6,7 +6,12 @@ import numpy as np
 from robomimic.utils.dataset import SequenceDataset
 
 import wandb
-from faster.data.robomimic_datasets import OBS_KEYS, process_robomimic_dataset
+from faster.data.robomimic_datasets import (
+    IMAGE_OBS_KEYS,
+    LOW_DIM_OBS_KEYS,
+    PROPRIOCEPTION_KEYS,
+    process_robomimic_dataset,
+)
 from faster.evaluation import evaluate_robo
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -91,8 +96,13 @@ def _build_gitignore_exclude_fn(repo_root):
 _SOURCE_CODE_INCLUDE_ROOTS = ("faster", "configs")
 
 
+def _is_mapping(x):
+    # ds.sample()/replay_buffer.sample() return flax FrozenDicts; image obs is a nested mapping.
+    return isinstance(x, dict) or type(x).__name__ == "FrozenDict"
+
+
 def _batch_size(tree):
-    if isinstance(tree, dict):
+    if _is_mapping(tree):
         first_key = next(iter(tree))
         return _batch_size(tree[first_key])
     return tree.shape[0]
@@ -101,7 +111,7 @@ def _batch_size(tree):
 def _combine_with_indices(one_tree, other_tree, shuffle_indices):
     combined = {}
     for k, v in one_tree.items():
-        if isinstance(v, dict):
+        if _is_mapping(v):
             combined[k] = _combine_with_indices(v, other_tree[k], shuffle_indices)
         else:
             other_v = other_tree[k]
@@ -120,7 +130,7 @@ def combine(one_dict, other_dict, rng):
 def combine_half(one_dict, other_dict, rng):
     combined = {}
     for k, v in one_dict.items():
-        if isinstance(v, dict):
+        if _is_mapping(v):
             combined[k] = combine_half(v, other_dict[k], rng)
         else:
             other_v = other_dict[k]
@@ -142,15 +152,21 @@ def _sample_action(agent, observation):
     return np.asarray(action), agent
 
 
-def _load_robomimic_dataset(dataset_path):
+def _load_robomimic_dataset(dataset_path, use_image_obs=False):
+    # Image mode: load PROPRIOCEPTION_KEYS (respects PROPRIO_VELOCITY toggle, no object) + images.
+    # Low-dim mode: LOW_DIM_OBS_KEYS (base proprio + object). Must match process_robomimic_dataset.
+    if use_image_obs:
+        obs_keys = tuple(PROPRIOCEPTION_KEYS) + tuple(IMAGE_OBS_KEYS)
+    else:
+        obs_keys = tuple(LOW_DIM_OBS_KEYS)
     seq_dataset = SequenceDataset(
         hdf5_path=str(dataset_path),
-        obs_keys=OBS_KEYS,
+        obs_keys=obs_keys,
         dataset_keys=("actions", "rewards", "dones"),
         hdf5_cache_mode="all",
         load_next_obs=True,
     )
-    return process_robomimic_dataset(seq_dataset)
+    return process_robomimic_dataset(seq_dataset, use_image_obs=use_image_obs)
 
 
 def _build_source_code_include_fn(repo_root):

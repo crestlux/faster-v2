@@ -23,10 +23,14 @@ from faster.networks import (
     DiffusionMLPResNet,
     Ensemble,
     FourierFeatures,
+    ImageStateEncoder,
     MLPResNetV2,
+    SharedEncoderEnsembleCritic,
     StateActionValue,
+    augment_obs_batch,
     cosine_beta_schedule,
     ddim_sampler,
+    get_resnet18,
     subsample_ensemble,
     vp_beta_schedule,
 )
@@ -36,6 +40,120 @@ def decay_mask_fn(params):
     flat_params = flax.traverse_util.flatten_dict(params)
     flat_mask = {path: path[-1] != "bias" for path in flat_params}
     return flax.core.FrozenDict(flax.traverse_util.unflatten_dict(flat_mask))
+
+
+def _load_pretrained_resnet18_conv_weights(params, in_channels=3):
+    """Replace conv kernels in any img_encoder within params with ImageNet pretrained weights.
+
+    GroupNorm params are left at their random init values (they adapt during fine-tuning).
+    For in_channels != 3 the first conv weights are adapted by averaging over the 3 input
+    channels and tiling, preserving the pretrained filter magnitudes.
+    """
+    try:
+        import torch
+        from torchvision.models import ResNet18_Weights, resnet18
+        pt = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1).state_dict()
+    except Exception as e:
+        print(f"[pretrained_encoder] skipping: {e}")
+        return params
+
+    def pt_conv(t):
+        """PyTorch (out,in,H,W) -> JAX/Flax (H,W,in,out)."""
+        return jnp.array(t.detach().cpu().float().numpy().transpose(2, 3, 1, 0))
+
+    def adapt_first_conv(t, in_ch):
+        """Average 3-ch pretrained weights across channels, tile to in_ch."""
+        w = t.detach().cpu().float().numpy()  # (64, 3, 7, 7)
+        w_avg = w.mean(axis=1, keepdims=True)  # (64, 1, 7, 7)
+        w_tiled = np.tile(w_avg, (1, in_ch, 1, 1))  # (64, in_ch, 7, 7)
+        return jnp.array(w_tiled.transpose(2, 3, 1, 0))  # (7, 7, in_ch, 64)
+
+    MAPPING = {
+        "conv1.weight":                 "img_encoder/conv_init/kernel",
+        "layer1.0.conv1.weight":        "img_encoder/ResNetBlock_0/Conv_0/kernel",
+        "layer1.0.conv2.weight":        "img_encoder/ResNetBlock_0/Conv_1/kernel",
+        "layer1.1.conv1.weight":        "img_encoder/ResNetBlock_1/Conv_0/kernel",
+        "layer1.1.conv2.weight":        "img_encoder/ResNetBlock_1/Conv_1/kernel",
+        "layer2.0.conv1.weight":        "img_encoder/ResNetBlock_2/Conv_0/kernel",
+        "layer2.0.downsample.0.weight": "img_encoder/ResNetBlock_2/conv_proj/kernel",
+        "layer2.0.conv2.weight":        "img_encoder/ResNetBlock_2/Conv_1/kernel",
+        "layer2.1.conv1.weight":        "img_encoder/ResNetBlock_3/Conv_0/kernel",
+        "layer2.1.conv2.weight":        "img_encoder/ResNetBlock_3/Conv_1/kernel",
+        "layer3.0.conv1.weight":        "img_encoder/ResNetBlock_4/Conv_0/kernel",
+        "layer3.0.downsample.0.weight": "img_encoder/ResNetBlock_4/conv_proj/kernel",
+        "layer3.0.conv2.weight":        "img_encoder/ResNetBlock_4/Conv_1/kernel",
+        "layer3.1.conv1.weight":        "img_encoder/ResNetBlock_5/Conv_0/kernel",
+        "layer3.1.conv2.weight":        "img_encoder/ResNetBlock_5/Conv_1/kernel",
+        "layer4.0.conv1.weight":        "img_encoder/ResNetBlock_6/Conv_0/kernel",
+        "layer4.0.downsample.0.weight": "img_encoder/ResNetBlock_6/conv_proj/kernel",
+        "layer4.0.conv2.weight":        "img_encoder/ResNetBlock_6/Conv_1/kernel",
+        "layer4.1.conv1.weight":        "img_encoder/ResNetBlock_7/Conv_0/kernel",
+        "layer4.1.conv2.weight":        "img_encoder/ResNetBlock_7/Conv_1/kernel",
+    }
+
+    params_dict = flax.core.unfreeze(params) if isinstance(params, flax.core.FrozenDict) else dict(params)
+    flat = flax.traverse_util.flatten_dict(params_dict, sep="/")
+
+    loaded = 0
+    for pt_key, suffix in MAPPING.items():
+        if pt_key not in pt:
+            continue
+        for flat_key in list(flat.keys()):
+            if flat_key.endswith(suffix):
+                if pt_key == "conv1.weight":
+                    flat[flat_key] = adapt_first_conv(pt[pt_key], in_channels)
+                else:
+                    flat[flat_key] = pt_conv(pt[pt_key])
+                loaded += 1
+
+    print(f"[pretrained_encoder] loaded {loaded}/{len(MAPPING)} conv layers from ImageNet ResNet18")
+    return flax.traverse_util.unflatten_dict(flat, sep="/")
+
+
+def _make_split_encoder_tx(params, base_tx, encoder_lr=1e-5):
+    """Wrap base_tx so ImageStateEncoder_0 params use a fixed smaller encoder_lr."""
+    try:
+        params_dict = flax.core.unfreeze(params) if isinstance(params, flax.core.FrozenDict) else dict(params)
+        flat = flax.traverse_util.flatten_dict(params_dict, sep="/")
+        labels = {k: ("encoder" if "ImageStateEncoder_0" in k else "model") for k in flat}
+        label_tree = flax.traverse_util.unflatten_dict(labels, sep="/")
+        return optax.multi_transform(
+            transforms={"encoder": optax.adamw(encoder_lr), "model": base_tx},
+            param_labels=label_tree,
+        )
+    except Exception as e:
+        print(f"[split_encoder_tx] fallback to base_tx: {e}")
+        return base_tx
+
+
+def _copy_actor_enc_to_ensemble_params(ensemble_params, actor_enc_params):
+    """Copy the actor's pretrained ImageStateEncoder_0 weights into the critic encoder.
+
+    Handles both the shared-single-encoder case (shapes match directly) and the legacy
+    per-member ensemble case (a leading vmap dimension is broadcast across members).
+    Gives the critic a pretrained visual backbone from day 1.
+    """
+    params_dict = flax.core.unfreeze(ensemble_params)
+    actor_enc_dict = flax.core.unfreeze(actor_enc_params)
+
+    flat_ens = flax.traverse_util.flatten_dict(params_dict, sep="/")
+    flat_actor = flax.traverse_util.flatten_dict({"ImageStateEncoder_0": actor_enc_dict}, sep="/")
+
+    loaded = 0
+    for actor_suffix, actor_val in flat_actor.items():
+        actor_arr = jnp.asarray(actor_val)
+        for ens_key in list(flat_ens.keys()):
+            if ens_key.endswith(actor_suffix):
+                ens_shape = flat_ens[ens_key].shape
+                if ens_shape == actor_arr.shape:
+                    flat_ens[ens_key] = actor_arr
+                    loaded += 1
+                elif len(ens_shape) == len(actor_arr.shape) + 1 and ens_shape[1:] == actor_arr.shape:
+                    flat_ens[ens_key] = jnp.broadcast_to(actor_arr[None], ens_shape)
+                    loaded += 1
+
+    print(f"[copy_actor_enc] copied {loaded}/{len(flat_actor)} params to critic encoder")
+    return flax.traverse_util.unflatten_dict(flat_ens, sep="/")
 
 
 @partial(jax.jit, static_argnames=("critic_fn",))
@@ -53,25 +171,41 @@ def _sample_actions(rng, apply_fn, params, observations: np.ndarray) -> np.ndarr
 
 @jax.jit
 def _sample_actions_jit(agent, observations):
-    rng = agent.rng
-    observations = jnp.squeeze(observations)
-    assert observations.ndim == 1, observations.shape
-    observations = jnp.expand_dims(observations, axis=0)
+    return _deploy_select_action(agent, observations, agent.filter_temperature_train)
 
+
+@jax.jit
+def _eval_actions_jit(agent, observations):
+    return _deploy_select_action(agent, observations, agent.filter_temperature_eval)
+
+
+def _deploy_select_action(agent, observations, filter_temperature):
+    """Shared deploy/eval action selection (official math, image-aware boundary encoding).
+
+    Differs from low-dim only in that the raw {state,image} dict is encoded ONCE up front:
+    `af` = actor features (target_actor encoder) drive candidate generation + the edit actor;
+    `cf` = critic features (target_critic encoder) drive the top-Q selection. For low-dim both
+    collapse to the flat observation, so the body is identical to the official.
+    """
+    rng = agent.rng
+    observations = jax.tree_map(lambda x: jnp.squeeze(x), observations)
+    observations = jax.tree_map(lambda x: jnp.expand_dims(x, axis=0) if (x.ndim == 1 or x.ndim == 3) else x, observations)
+
+    af = agent._encode_obs(observations, agent.target_actor.params)   # actor features (B, enc_a)
+    cf = agent._encode_obs(observations, agent.target_critic.params)  # critic features (B, enc_c)
     actor_params = agent.target_actor.params
+
     if agent.filter_enabled and agent.filter_at_eval:
-        actions, _, rng = agent._sample_candidates(rng, observations, agent.N, actor_params, agent.filter_temperature_train)
+        actions, _, rng = agent._sample_candidates(rng, af, agent.N, actor_params, filter_temperature)
     else:
-        observations_repeated = jnp.broadcast_to(
-            observations[:, None, :], (observations.shape[0], agent.N, observations.shape[-1])
-        ).reshape(-1, observations.shape[-1])
+        af_repeated = jnp.broadcast_to(af[:, None, :], (af.shape[0], agent.N, af.shape[-1])).reshape(-1, af.shape[-1])
         actions, rng = ddim_sampler(
             agent.actor.apply_fn,
             actor_params,
             agent.T,
             rng,
             agent.action_dim,
-            observations_repeated,
+            af_repeated,
             agent.alphas,
             agent.alpha_hats,
             agent.betas,
@@ -85,22 +219,19 @@ def _sample_actions_jit(agent, observations):
     if diffusion_actions.shape[0] > 1 or agent.ne_samples > 0:
         key, rng = jax.random.split(rng)
         target_params = subsample_ensemble(key, agent.target_critic.params, agent.num_min_qs, agent.num_qs)
-        obs_rep = jnp.broadcast_to(
-            observations[:, None, :], (observations.shape[0], diffusion_actions.shape[0], observations.shape[-1])
-        ).reshape(-1, observations.shape[-1])
+        obs_rep = jnp.broadcast_to(cf[:, None, :], (cf.shape[0], diffusion_actions.shape[0], cf.shape[-1])).reshape(-1, cf.shape[-1])
         all_actions = diffusion_actions
 
         if agent.ne_samples > 0:
             key, rng = jax.random.split(rng)
             d_actions = diffusion_actions[: agent.ne_samples]
-            r_obs = jnp.broadcast_to(observations[:, None, :], (observations.shape[0], agent.ne_samples, observations.shape[-1])).reshape(
-                -1, observations.shape[-1]
-            )
-            r_in = jnp.concatenate([r_obs, d_actions], axis=1)
+            r_obs_a = jnp.broadcast_to(af[:, None, :], (af.shape[0], agent.ne_samples, af.shape[-1])).reshape(-1, af.shape[-1])
+            r_in = jnp.concatenate([r_obs_a, d_actions], axis=1)
             r_samples, rng = _sample_actions(key, agent.edit_actor.apply_fn, agent.edit_actor.params, r_in)
             r_samples = agent._apply_residual_action_mask(r_samples * agent.r_action_scale) + d_actions
             r_samples = jnp.clip(r_samples, -1.0, 1.0)
-            obs_rep = jnp.concatenate([obs_rep, r_obs], axis=0)
+            r_obs_c = jnp.broadcast_to(cf[:, None, :], (cf.shape[0], agent.ne_samples, cf.shape[-1])).reshape(-1, cf.shape[-1])
+            obs_rep = jnp.concatenate([obs_rep, r_obs_c], axis=0)
             all_actions = jnp.concatenate([all_actions, r_samples], axis=0)
 
         qs = compute_q(agent.target_critic.apply_fn, target_params, obs_rep, all_actions)
@@ -335,6 +466,29 @@ class FasterEXPOLearner(Agent):
     num_qs: int = struct.field(pytree_node=False)
     num_min_qs: Optional[int] = struct.field(pytree_node=False)
     filter_num_min_qs: Optional[int] = struct.field(pytree_node=False)
+    # --- image-observation extension ---
+    share_encoder: bool = struct.field(pytree_node=False)
+    state_proj_dim: int = struct.field(pytree_node=False)
+    vision_pool: str = struct.field(pytree_node=False)
+    num_kp: int = struct.field(pytree_node=False)
+    augment: bool = struct.field(pytree_node=False)
+
+    def _encode_obs(self, observations, encoder_params):
+        """Encode {state, image} -> flat features with the given encoder's params.
+
+        Flat arrays (low-dim, or features already produced at the deploy/eval boundary)
+        pass straight through, so callers can run the official flat-observation logic
+        unchanged. ``encoder_params`` is the params dict of whichever TrainState owns the
+        encoder (e.g. self.target_actor.params for the actor encoder, or
+        self.target_critic.params for the critic encoder).
+        """
+        if not (isinstance(observations, (dict, flax.core.FrozenDict)) and "image" in observations):
+            return observations
+        if "ImageStateEncoder_0" not in encoder_params:
+            return observations
+        return ImageStateEncoder(
+            encoder_cls=get_resnet18, state_proj_dim=self.state_proj_dim, pool=self.vision_pool, num_kp=self.num_kp
+        ).apply({"params": encoder_params["ImageStateEncoder_0"]}, observations, training=False)
 
     @classmethod
     def create(
@@ -345,6 +499,8 @@ class FasterEXPOLearner(Agent):
         actor_lr: float = 3e-4,
         critic_lr: float = 3e-4,
         temp_lr: float = 3e-4,
+        actor_encoder_lr: float = 1e-5,   # image-encoder LR for the actor (split from the MLP heads)
+        critic_encoder_lr: float = 1e-4,  # image-encoder LR for the critic (warm-started from actor enc)
         hidden_dims: Sequence[int] = (256, 256),
         critic_hidden_dims: Optional[Sequence[int]] = None,
         outer_critic_hidden_dims: Optional[Sequence[int]] = None,
@@ -384,6 +540,11 @@ class FasterEXPOLearner(Agent):
         filter_temperature_train: Optional[float] = None,
         filter_temperature_eval: Optional[float] = None,
         filter_temperature_mode: str = "plain",
+        share_encoder: bool = False,
+        state_proj_dim: int = 0,
+        vision_pool: str = "gap",
+        num_kp: int = 32,
+        augment: bool = False,
     ):
         action_dim = action_space.shape[-1]
         if residual_action_mask is not None:
@@ -432,16 +593,45 @@ class FasterEXPOLearner(Agent):
             out_dim=action_dim,
             activations=nn.swish,
         )
-        actor_def = DDPM(time_preprocess_cls=preprocess_time_cls, cond_encoder_cls=cond_model_cls, reverse_encoder_cls=base_model_cls)
+        # Image encoder factory: identical config for the actor and the critic encoders.
+        enc_factory = partial(
+            ImageStateEncoder, encoder_cls=get_resnet18, state_proj_dim=state_proj_dim, pool=vision_pool, num_kp=num_kp
+        )
+        actor_def = DDPM(
+            time_preprocess_cls=preprocess_time_cls,
+            cond_encoder_cls=cond_model_cls,
+            reverse_encoder_cls=base_model_cls,
+            obs_encoder_cls=enc_factory,
+        )
 
         time = jnp.zeros((1, 1))
-        observations = jnp.expand_dims(jnp.asarray(observations), axis=0)
+        observations = jax.tree_map(lambda x: jnp.expand_dims(jnp.asarray(x), axis=0), observations)
         actions = jnp.expand_dims(jnp.asarray(actions), axis=0)
         actor_params = actor_def.init(actor_key, observations, actions, time)["params"]
-        actor = TrainState.create(apply_fn=actor_def.apply, params=actor_params, tx=optax.adamw(learning_rate=actor_lr))
+        _is_image = (
+            isinstance(observations, (dict, flax.core.FrozenDict))
+            and "image" in observations
+            and "ImageStateEncoder_0" in actor_params
+        )
+        if _is_image:
+            _in_ch = int(jnp.asarray(observations["image"]).shape[-1])
+            actor_params = _load_pretrained_resnet18_conv_weights(actor_params, _in_ch)
+            actor_tx = _make_split_encoder_tx(actor_params, optax.adamw(learning_rate=actor_lr), encoder_lr=actor_encoder_lr)
+        else:
+            actor_tx = optax.adamw(learning_rate=actor_lr)
+        actor = TrainState.create(apply_fn=actor_def.apply, params=actor_params, tx=actor_tx)
         target_actor = TrainState.create(
             apply_fn=actor_def.apply, params=actor_params, tx=optax.GradientTransformation(lambda _: None, lambda _: None)
         )
+
+        # Flat actor-encoded example for the edit actor / filter critic, which consume the
+        # actor's features (not raw dicts). For low-dim this is just `observations`.
+        if _is_image:
+            example_actor_feat = enc_factory().apply(
+                {"params": actor_params["ImageStateEncoder_0"]}, observations, training=False
+            )
+        else:
+            example_actor_feat = observations
 
         if beta_schedule == "cosine":
             betas = jnp.array(cosine_beta_schedule(T))
@@ -457,7 +647,10 @@ class FasterEXPOLearner(Agent):
 
         edit_actor_base_cls = partial(MLP, hidden_dims=hidden_dims, dropout_rate=actor_drop, activate_final=True, use_pnorm=use_pnorm)
         edit_actor_def = TanhNormal(edit_actor_base_cls, action_dim)
-        edit_observations = jnp.concatenate([observations, jnp.ones((1, action_dim))], axis=1)
+        # The edit actor always receives flat actor-encoded features (state_proj_dim-respecting),
+        # never a raw obs dict — at training (update_edit_actor) and candidate selection. Init it
+        # on that same flat encoding so it stays a pure MLP (no vestigial ResNet).
+        edit_observations = jnp.concatenate([example_actor_feat, jnp.ones((1, action_dim))], axis=1)
         edit_actor_params = edit_actor_def.init(actor_key, edit_observations)["params"]
         edit_actor = TrainState.create(apply_fn=edit_actor_def.apply, params=edit_actor_params, tx=optax.adam(learning_rate=actor_lr))
 
@@ -486,14 +679,25 @@ class FasterEXPOLearner(Agent):
 
         outer_critic_cls = make_outer_critic_cls(outer_critic_hidden_dims)
         filter_critic_cls = make_filter_critic_cls(filter_critic_hidden_dims)
-        critic_def = Ensemble(outer_critic_cls, num=num_qs)
-        critic_params = critic_def.init(critic_key, observations, actions)["params"]
+        # Single shared encoder feeding the Q-head ensemble (see SharedEncoderEnsembleCritic).
+        # share_encoder=False (default): the critic init sees the RAW obs dict, so it builds its
+        #   OWN ImageStateEncoder (TD-trained, warm-started from the actor). This decouples Q
+        #   scoring from the slow actor_tau encoder lag.
+        # share_encoder=True: the critic init sees flat actor features, so its encoder passes
+        #   through and no ImageStateEncoder_0 params are created (it reuses the actor encoding).
+        critic_obs_example = example_actor_feat if share_encoder else observations
+        critic_def = SharedEncoderEnsembleCritic(encoder_cls=enc_factory, net_cls=outer_critic_cls, num_qs=num_qs)
+        critic_params = critic_def.init(critic_key, critic_obs_example, actions)["params"]
+        _critic_has_enc = _is_image and not share_encoder and "ImageStateEncoder_0" in critic_params
+        if _critic_has_enc:
+            critic_params = _copy_actor_enc_to_ensemble_params(critic_params, actor_params["ImageStateEncoder_0"])
         if critic_weight_decay is not None:
-            tx = optax.adamw(learning_rate=critic_lr, weight_decay=critic_weight_decay, mask=decay_mask_fn)
+            base_tx = optax.adamw(learning_rate=critic_lr, weight_decay=critic_weight_decay, mask=decay_mask_fn)
         else:
-            tx = optax.adam(learning_rate=critic_lr)
+            base_tx = optax.adam(learning_rate=critic_lr)
+        tx = _make_split_encoder_tx(critic_params, base_tx, encoder_lr=critic_encoder_lr) if _critic_has_enc else base_tx
         critic = TrainState.create(apply_fn=critic_def.apply, params=critic_params, tx=tx)
-        target_critic_def = Ensemble(outer_critic_cls, num=target_num_qs)
+        target_critic_def = SharedEncoderEnsembleCritic(encoder_cls=enc_factory, net_cls=outer_critic_cls, num_qs=target_num_qs)
         target_critic = TrainState.create(
             apply_fn=target_critic_def.apply, params=critic_params, tx=optax.GradientTransformation(lambda _: None, lambda _: None)
         )
@@ -516,7 +720,9 @@ class FasterEXPOLearner(Agent):
 
             rng, hidden_key = jax.random.split(rng)
             hidden_def = Ensemble(filter_critic_cls, num=num_qs)
-            hidden_params = hidden_def.init(hidden_key, observations, actions, time)["params"]
+            # Filter critic scores noise candidates on the actor's flat features (it is trained
+            # on actor-encoded next-obs features in update_critic_from_candidates).
+            hidden_params = hidden_def.init(hidden_key, example_actor_feat, actions, time)["params"]
             filter_critic = TrainState.create(apply_fn=hidden_def.apply, params=hidden_params, tx=optax.adam(learning_rate=critic_lr))
             target_hidden_def = Ensemble(filter_critic_cls, num=target_filter_num_qs)
             target_filter_critic = TrainState.create(
@@ -558,6 +764,11 @@ class FasterEXPOLearner(Agent):
             filter_temperature_train=htemp_train,
             filter_temperature_eval=htemp_eval,
             filter_temperature_mode=filter_temperature_mode,
+            share_encoder=bool(share_encoder),
+            state_proj_dim=int(state_proj_dim),
+            vision_pool=str(vision_pool),
+            num_kp=int(num_kp),
+            augment=bool(augment),
         )
 
     def _sample_candidates(self, rng, observations, N, actor_params, filter_temperature):
@@ -634,20 +845,22 @@ class FasterEXPOLearner(Agent):
         mask = jnp.asarray(self.residual_action_mask, dtype=residual_actions.dtype)
         return residual_actions * mask
 
-    def _select_best_actions(self, rng, observations, actions, target_params):
-        batch_size = observations.shape[0]
+    def _select_best_actions(self, rng, actor_feat, critic_feat, actions, target_params):
+        # actor_feat drives the edit actor; critic_feat drives the Q scoring. For low-dim both
+        # are the same flat observation, so this matches the official math exactly.
+        batch_size = critic_feat.shape[0]
         num_candidates = actions.shape[1]
         total_candidates = num_candidates + self.ne_samples_train
-        observations_repeated = jnp.broadcast_to(observations[:, None, :], (batch_size, total_candidates, observations.shape[-1])).reshape(
-            -1, observations.shape[-1]
-        )
+        observations_repeated = jnp.broadcast_to(
+            critic_feat[:, None, :], (batch_size, total_candidates, critic_feat.shape[-1])
+        ).reshape(-1, critic_feat.shape[-1])
         actions_all = actions
 
         if self.ne_samples_train > 0:
             key, rng = jax.random.split(rng)
             r_observations = jnp.broadcast_to(
-                observations[:, None, :], (batch_size, self.ne_samples_train, observations.shape[-1])
-            ).reshape(-1, observations.shape[-1])
+                actor_feat[:, None, :], (batch_size, self.ne_samples_train, actor_feat.shape[-1])
+            ).reshape(-1, actor_feat.shape[-1])
             d_actions = actions[:, : self.ne_samples_train].reshape(-1, actions.shape[-1])
             r_observations = jnp.concatenate([r_observations, d_actions], axis=1)
             r_samples, rng = _sample_actions(key, self.edit_actor.apply_fn, self.edit_actor.params, r_observations)
@@ -672,64 +885,8 @@ class FasterEXPOLearner(Agent):
         return best_actions, best_q, best_indices, rng
 
     def eval_actions(self, observations):
-        rng = self.rng
-        observations = jnp.squeeze(observations)
-        assert len(observations.shape) == 1
-        observations = jax.device_put(observations)
-        observations = jnp.expand_dims(observations, axis=0)
-
-        actor_params = self.target_actor.params
-        if self.filter_enabled and self.filter_at_eval:
-            actions, _, rng = self._sample_candidates(rng, observations, self.N, actor_params, self.filter_temperature_eval)
-        else:
-            observations_repeated = jnp.broadcast_to(
-                observations[:, None, :], (observations.shape[0], self.N, observations.shape[-1])
-            ).reshape(-1, observations.shape[-1])
-            actions, rng = ddim_sampler(
-                self.actor.apply_fn,
-                actor_params,
-                self.T,
-                rng,
-                self.action_dim,
-                observations_repeated,
-                self.alphas,
-                self.alpha_hats,
-                self.betas,
-                self.M,
-                eta=self.ddim_eta,
-            )
-            actions = actions.reshape(1, self.N, -1)
-
-        diffusion_actions = actions.squeeze(axis=0)
-
-        if diffusion_actions.shape[0] > 1 or self.ne_samples > 0:
-            key, rng = jax.random.split(rng)
-            target_params = subsample_ensemble(key, self.target_critic.params, self.num_min_qs, self.num_qs)
-            obs_rep = jnp.broadcast_to(
-                observations[:, None, :], (observations.shape[0], diffusion_actions.shape[0], observations.shape[-1])
-            ).reshape(-1, observations.shape[-1])
-            all_actions = diffusion_actions
-
-            if self.ne_samples > 0:
-                key, rng = jax.random.split(rng)
-                d_actions = diffusion_actions[: self.ne_samples]
-                r_obs = jnp.broadcast_to(
-                    observations[:, None, :], (observations.shape[0], self.ne_samples, observations.shape[-1])
-                ).reshape(-1, observations.shape[-1])
-                r_in = jnp.concatenate([r_obs, d_actions], axis=1)
-                r_samples, rng = _sample_actions(key, self.edit_actor.apply_fn, self.edit_actor.params, r_in)
-                r_samples = self._apply_residual_action_mask(r_samples * self.r_action_scale) + d_actions
-                r_samples = jnp.clip(r_samples, -1.0, 1.0)
-                obs_rep = jnp.concatenate([obs_rep, r_obs], axis=0)
-                all_actions = jnp.concatenate([all_actions, r_samples], axis=0)
-
-            qs = compute_q(self.target_critic.apply_fn, target_params, obs_rep, all_actions)
-            idx = jnp.argmax(qs)
-            action = all_actions[idx]
-        else:
-            action = diffusion_actions[0]
-
-        rng, _ = jax.random.split(rng)
+        # Deterministic deploy (filter_temperature_eval); image-aware via _deploy_select_action.
+        action, rng = _eval_actions_jit(self, observations)
         return np.array(action.squeeze()), self.replace(rng=rng)
 
     def sample_actions(self, observations):
@@ -742,8 +899,13 @@ class FasterEXPOLearner(Agent):
         key2, rng = jax.random.split(rng)
         dropout_key, rng = jax.random.split(rng)
 
+        # Edit actor consumes the actor's flat features (computed outside the grad: it is a
+        # constant w.r.t. edit_actor params, and the critic Q below still sees the raw obs dict
+        # so its own encoder gets the gradient). For low-dim this is just batch["observations"].
+        actor_feat = self._encode_obs(batch["observations"], self.actor.params)
+
         def edit_actor_loss_fn(actor_params):
-            edit_observations = jnp.concatenate([batch["observations"], batch["actions"]], axis=1)
+            edit_observations = jnp.concatenate([actor_feat, batch["actions"]], axis=1)
             dist = self.edit_actor.apply_fn({"params": actor_params}, edit_observations, training=True, rngs={"dropout": dropout_key})
             actions = dist.sample(seed=key)
             log_probs = dist.log_prob(actions)
@@ -803,11 +965,17 @@ class FasterEXPOLearner(Agent):
     @jax.jit
     def update_critic_from_candidates(self, batch: DatasetDict, next_actions_candidates: jnp.ndarray, stored, rng):
         next_obs = batch["next_observations"]
+        # next_obs features: actor encoder drives the edit actor + filter critic; the (target)
+        # critic encoder drives the Q scoring. For low-dim both collapse to next_obs.
+        next_actor_feat = self._encode_obs(next_obs, self.actor.params)
+        next_critic_feat = self._encode_obs(next_obs, self.target_critic.params)
 
         key, rng = jax.random.split(rng)
         target_params = subsample_ensemble(key, self.target_critic.params, self.num_min_qs, self.num_qs)
 
-        next_actions, next_q, _, rng = self._select_best_actions(rng, next_obs, next_actions_candidates, target_params)
+        next_actions, next_q, _, rng = self._select_best_actions(
+            rng, next_actor_feat, next_critic_feat, next_actions_candidates, target_params
+        )
         target_q = batch["rewards"] + self.discount * batch["masks"] * next_q
 
         key, rng = jax.random.split(rng)
@@ -826,19 +994,23 @@ class FasterEXPOLearner(Agent):
         target_filter_critic = self.target_filter_critic
         if self.filter_enabled and stored and filter_critic is not None and target_filter_critic is not None:
             k_final = next_actions_candidates.shape[1]
-            obs_rep = jnp.broadcast_to(next_obs[:, None, :], (next_obs.shape[0], k_final, next_obs.shape[-1])).reshape(
-                -1, next_obs.shape[-1]
-            )
+            # q0 target: outer (target) critic -> critic features. Filter scoring -> actor features.
+            obs_rep_c = jnp.broadcast_to(
+                next_critic_feat[:, None, :], (next_critic_feat.shape[0], k_final, next_critic_feat.shape[-1])
+            ).reshape(-1, next_critic_feat.shape[-1])
+            obs_rep_a = jnp.broadcast_to(
+                next_actor_feat[:, None, :], (next_actor_feat.shape[0], k_final, next_actor_feat.shape[-1])
+            ).reshape(-1, next_actor_feat.shape[-1])
             a0_flat = next_actions_candidates.reshape(-1, next_actions_candidates.shape[-1])
-            q0 = compute_q(self.target_critic.apply_fn, target_params, obs_rep, a0_flat).reshape(-1, k_final)
+            q0 = compute_q(self.target_critic.apply_fn, target_params, obs_rep_c, a0_flat).reshape(-1, k_final)
             q0 = jax.lax.stop_gradient(q0)
             rng, drop_key = jax.random.split(rng)
             num_stages = len(stored)
             stored_actions = jnp.stack(stored, axis=0)
             a_stacked = stored_actions.reshape(-1, stored_actions.shape[-1])
             q0_flat = q0.reshape(-1)
-            obs_stacked = jnp.broadcast_to(obs_rep[None, :, :], (num_stages, obs_rep.shape[0], obs_rep.shape[1])).reshape(
-                -1, obs_rep.shape[-1]
+            obs_stacked = jnp.broadcast_to(obs_rep_a[None, :, :], (num_stages, obs_rep_a.shape[0], obs_rep_a.shape[1])).reshape(
+                -1, obs_rep_a.shape[-1]
             )
             t_stages = jnp.asarray((self.T,), dtype=jnp.int32)
             q_targets = jnp.broadcast_to(q0_flat[None, :], (num_stages, q0_flat.shape[0]))
@@ -875,16 +1047,28 @@ class FasterEXPOLearner(Agent):
         next_obs = batch["next_observations"]
 
         actor_params = self.actor.params
+        # Candidate generation (actor denoising + filter scoring) runs on the actor's flat
+        # features; for low-dim this is just next_obs.
+        next_actor_feat = self._encode_obs(next_obs, actor_params)
         next_actions_candidates, stored, rng = self._sample_candidates(
-            rng, next_obs, self.train_N, actor_params, self.filter_temperature_train
+            rng, next_actor_feat, self.train_N, actor_params, self.filter_temperature_train
         )
         return self.update_critic_from_candidates(batch, next_actions_candidates, stored, rng)
 
     @partial(jax.jit, static_argnames=("utd_ratio", "pretrain_q", "pretrain_r"))
     def update_offline(self, batch: DatasetDict, utd_ratio: int, pretrain_q: bool, pretrain_r: bool):
         assert utd_ratio > 0
-        assert batch["observations"].shape[0] % utd_ratio == 0
-        mini_batch_size = batch["observations"].shape[0] // utd_ratio
+        batch_size = jax.tree_util.tree_leaves(batch["observations"])[0].shape[0]
+        assert batch_size % utd_ratio == 0
+        mini_batch_size = batch_size // utd_ratio
+
+        # Image augmentation (no-op for low-dim or augment=False); advance rng past the aug keys.
+        if self.augment:
+            aug_rng, obs_key, next_key = jax.random.split(self.rng, 3)
+            batch = {**batch,
+                     "observations": augment_obs_batch(obs_key, batch["observations"]),
+                     "next_observations": augment_obs_batch(next_key, batch["next_observations"])}
+            self = self.replace(rng=aug_rng)
 
         def get_mini_batch(i):
             start = i * mini_batch_size
@@ -918,8 +1102,9 @@ class FasterEXPOLearner(Agent):
     @partial(jax.jit, static_argnames="utd_ratio")
     def update_separate(self, batch: DatasetDict, actor_batch: DatasetDict, utd_ratio: int):
         assert utd_ratio > 0
-        assert batch["observations"].shape[0] % utd_ratio == 0
-        mini_batch_size = batch["observations"].shape[0] // utd_ratio
+        batch_size = jax.tree_util.tree_leaves(batch["observations"])[0].shape[0]
+        assert batch_size % utd_ratio == 0
+        mini_batch_size = batch_size // utd_ratio
 
         def get_mini_batch(i):
             start = i * mini_batch_size
@@ -949,8 +1134,17 @@ class FasterEXPOLearner(Agent):
     @partial(jax.jit, static_argnames="utd_ratio")
     def update(self, batch: DatasetDict, utd_ratio: int):
         assert utd_ratio > 0
-        assert batch["observations"].shape[0] % utd_ratio == 0
-        mini_batch_size = batch["observations"].shape[0] // utd_ratio
+        batch_size = jax.tree_util.tree_leaves(batch["observations"])[0].shape[0]
+        assert batch_size % utd_ratio == 0
+        mini_batch_size = batch_size // utd_ratio
+
+        # Image augmentation (no-op for low-dim or augment=False); advance rng past the aug keys.
+        if self.augment:
+            aug_rng, obs_key, next_key = jax.random.split(self.rng, 3)
+            batch = {**batch,
+                     "observations": augment_obs_batch(obs_key, batch["observations"]),
+                     "next_observations": augment_obs_batch(next_key, batch["next_observations"])}
+            self = self.replace(rng=aug_rng)
 
         def get_mini_batch(i):
             start = i * mini_batch_size
@@ -1030,5 +1224,14 @@ def get_config():
     config.actor_tau = 0.001
     config.actor_num_blocks = 3
     config.decay_steps = int(3e6)
+
+    # --- image-observation extension (no-op for low-dim) ---
+    config.actor_encoder_lr = 1e-5
+    config.critic_encoder_lr = 1e-4
+    config.share_encoder = False
+    config.state_proj_dim = 0
+    config.vision_pool = "gap"
+    config.num_kp = 32
+    config.augment = False
 
     return config

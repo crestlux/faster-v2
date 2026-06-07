@@ -5,6 +5,8 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 
+from faster.networks.resnet import ImageStateEncoder, get_resnet18
+
 
 def cosine_beta_schedule(timesteps, s=0.008):
     """
@@ -50,12 +52,32 @@ class DDPM(nn.Module):
     cond_encoder_cls: Type[nn.Module]
     reverse_encoder_cls: Type[nn.Module]
     time_preprocess_cls: Type[nn.Module]
+    obs_encoder_cls: Optional[Type[nn.Module]] = None
 
     @nn.compact
-    def __call__(self, s: jnp.ndarray, a: jnp.ndarray, time: jnp.ndarray, training: bool = False):
+    def __call__(self, s, a: jnp.ndarray, time: jnp.ndarray, training: bool = False):
         t_ff = self.time_preprocess_cls()(time)
         cond = self.cond_encoder_cls()(t_ff, training=training)
-        reverse_input = jnp.concatenate([a, s, cond], axis=-1)
+
+        # Image support: a dict {state, image} is encoded to a flat vector. A flat array
+        # (e.g. actor-encoded features passed in by the deploy/eval boundary-encoding path,
+        # or low-dim observations) passes straight through, so all the existing flat-obs
+        # callers and ddim samplers keep working byte-for-byte.
+        if self.obs_encoder_cls is not None:
+            s_encoded = self.obs_encoder_cls()(s, training=training)
+        elif isinstance(s, dict) and "image" in s:
+            s_encoded = ImageStateEncoder(encoder_cls=get_resnet18)(s, training=training)
+        elif isinstance(s, dict):
+            s_encoded = s["state"]
+        else:
+            s_encoded = s
+
+        if a.shape[0] != s_encoded.shape[0] and a.shape[0] % s_encoded.shape[0] == 0:
+            s_encoded = jnp.repeat(s_encoded, a.shape[0] // s_encoded.shape[0], axis=0)
+        if a.shape[0] != cond.shape[0] and a.shape[0] % cond.shape[0] == 0:
+            cond = jnp.repeat(cond, a.shape[0] // cond.shape[0], axis=0)
+
+        reverse_input = jnp.concatenate([a, s_encoded, cond], axis=-1)
 
         return self.reverse_encoder_cls()(reverse_input, training=training)
 

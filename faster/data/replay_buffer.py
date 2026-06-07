@@ -49,24 +49,37 @@ def _coerce_replay_value(dataset_array: np.ndarray, value):
 
 
 def _insert_dataset_arrays(dataset_dict: DatasetDict, dataset: Dict[str, np.ndarray], capacity: int):
-    dataset_size = len(dataset["observations"])
-    if dataset_size <= capacity:
-        for key in dataset_dict:
-            if key in dataset:
-                dataset_dict[key][:dataset_size] = _coerce_replay_value(dataset_dict[key], dataset[key])
-        size = dataset_size
-    else:
+    dataset_size = len(jax.tree_util.tree_leaves(dataset["observations"])[0])
+    
+    def _insert_arrays_recursive(d_dict, d):
+        if isinstance(d_dict, dict) or type(d_dict).__name__ == 'FrozenDict':
+            for k in d_dict.keys():
+                if k in d:
+                    _insert_arrays_recursive(d_dict[k], d[k])
+        else:
+            if dataset_size <= capacity:
+                d_dict[:dataset_size] = _coerce_replay_value(d_dict, d)
+            else:
+                d_dict[:] = _coerce_replay_value(d_dict, d[indices])
+                
+    if dataset_size > capacity:
         indices = np.random.choice(dataset_size, capacity, replace=False)
-        for key in dataset_dict:
-            if key in dataset:
-                dataset_dict[key][:] = _coerce_replay_value(dataset_dict[key], dataset[key][indices])
-        size = capacity
+    else:
+        indices = None
+        
+    for key in dataset_dict:
+        if key in dataset:
+            _insert_arrays_recursive(dataset_dict[key], dataset[key])
+            
+    size = min(dataset_size, capacity)
     return size, size % capacity
 
 
-def _init_robo_replay_dict(example_observation: gym.Space, capacity: int) -> Union[np.ndarray, DatasetDict]:
-    # if isinstance(obs_space, gym.spaces.Box):
-    return np.empty((capacity, *example_observation.shape), dtype=example_observation.dtype)
+def _init_robo_replay_dict(example_observation: Union[np.ndarray, Dict], capacity: int) -> Union[np.ndarray, DatasetDict]:
+    if isinstance(example_observation, dict):
+        return {k: _init_robo_replay_dict(v, capacity) for k, v in example_observation.items()}
+    else:
+        return np.empty((capacity, *example_observation.shape), dtype=example_observation.dtype)
 
 
 def _device_put_numeric_leaves(batch):
@@ -124,9 +137,17 @@ class RoboReplayBuffer(Dataset):
         # Calculate indices for insertion (handling wrap-around)
         indices = np.arange(self._insert_index, self._insert_index + batch_size) % self._capacity
 
+        def _insert_batch_recursive(dataset_dict, data_dict):
+            if isinstance(dataset_dict, np.ndarray):
+                dataset_dict[indices] = data_dict
+            elif isinstance(dataset_dict, dict):
+                for k in dataset_dict.keys():
+                    if k in data_dict:
+                        _insert_batch_recursive(dataset_dict[k], data_dict[k])
+                        
         for key in self.dataset_dict.keys():
             if key in data_dict:
-                self.dataset_dict[key][indices] = data_dict[key]
+                _insert_batch_recursive(self.dataset_dict[key], data_dict[key])
 
         self._insert_index = (self._insert_index + batch_size) % self._capacity
         self._size = min(self._size + batch_size, self._capacity)

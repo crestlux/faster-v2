@@ -8,6 +8,8 @@ from datetime import datetime
 from pathlib import Path
 
 import cloudpickle as pickle
+import jax
+import jax.numpy as jnp
 import numpy as np
 import tqdm
 from absl import app, flags
@@ -70,6 +72,14 @@ flags.DEFINE_integer("utd_ratio", 20, "Update to data ratio.")
 flags.DEFINE_boolean("binary_include_bc", True, "Whether to include BC data in the binary datasets.")
 flags.DEFINE_boolean("pretrain_r", True, "Whether to include BC data in the binary datasets.")
 flags.DEFINE_boolean("pretrain_q", True, "Whether to include BC data in the binary datasets.")
+# --- Image observation support (dict {state, image}; excludes the privileged object state) ---
+flags.DEFINE_boolean("use_image_obs", False, "Use image observations (proprio + agentview/eye_in_hand).")
+flags.DEFINE_boolean("share_encoder", False, "Share the actor image encoder with the critic (stop_gradient). "
+                     "Default False: the critic owns a separate TD-trained encoder (warm-started from the actor).")
+flags.DEFINE_integer("state_proj_dim", 0, "Project proprioception to this dim before concat with image features (0=raw).")
+flags.DEFINE_string("vision_pool", "gap", "Vision pooling head: 'gap' (global avg pool) or 'spatial_softmax'.")
+flags.DEFINE_integer("num_kp", 32, "spatial_softmax keypoints; image-feature dim = 2*num_kp.")
+flags.DEFINE_boolean("augment_obs", False, "Apply random crop+resize+color jitter to images during training.")
 config_flags.DEFINE_config_file(
     "config", "faster/agents/faster_expo_learner.py", "File path to the training hyperparameter configuration.", lock_config=False
 )
@@ -108,6 +118,10 @@ def main(_):
     if "SLURM_JOB_ID" in os.environ:
         exp_name += f"id{os.environ['SLURM_JOB_ID']}_"
     exp_name += f"s{FLAGS.seed}"
+    if FLAGS.use_image_obs:
+        # Include vision_pool + pid so simultaneous launches (e.g. spatial_softmax vs gap on
+        # two GPUs in the same second) get distinct dirs instead of colliding on one log dir.
+        exp_name += f"_image_{FLAGS.vision_pool}_{os.getpid()}"
 
     log_dir = os.path.join(FLAGS.log_dir, exp_name)
     os.makedirs(log_dir, exist_ok=True)
@@ -127,22 +141,43 @@ def main(_):
         os.makedirs(buffer_dir, exist_ok=True)
 
     robomimic_root = robomimic_datasets_root(Path("datasets/robomimic"))
-    dataset_path = _resolve_robomimic_dataset_path(robomimic_root, FLAGS.env_name, "ph")
+    dataset_path = _resolve_robomimic_dataset_path(robomimic_root, FLAGS.env_name, "ph", use_image_obs=FLAGS.use_image_obs)
     if FLAGS.dataset_dir not in {"", "mh", "ph"}:
         with open(FLAGS.dataset_dir, "rb") as handle:
             dataset = pickle.load(handle)
         dataset["rewards"] = np.asarray(dataset["rewards"]).squeeze()
         dataset["terminals"] = np.asarray(dataset["terminals"]).squeeze()
     elif FLAGS.dataset_dir == "mh":
-        dataset = _load_robomimic_dataset(_resolve_robomimic_dataset_path(robomimic_root, FLAGS.env_name, "mh"))
+        dataset = _load_robomimic_dataset(
+            _resolve_robomimic_dataset_path(robomimic_root, FLAGS.env_name, "mh", use_image_obs=FLAGS.use_image_obs),
+            use_image_obs=FLAGS.use_image_obs,
+        )
     else:
-        dataset = _load_robomimic_dataset(dataset_path)
+        dataset = _load_robomimic_dataset(dataset_path, use_image_obs=FLAGS.use_image_obs)
 
     ds = RoboD4RLDataset(env=None, num_data=FLAGS.num_data, custom_dataset=dataset)
-    example_observation = ds.dataset_dict["observations"][0][np.newaxis]
+
+    # Push image-related FLAGS into the agent config (only if the config exposes them).
+    for _flag, _cfg in (
+        ("share_encoder", "share_encoder"),
+        ("state_proj_dim", "state_proj_dim"),
+        ("vision_pool", "vision_pool"),
+        ("num_kp", "num_kp"),
+        ("augment_obs", "augment"),
+    ):
+        if _cfg in FLAGS.config:
+            FLAGS.config[_cfg] = FLAGS[_flag].value
+
+    if FLAGS.use_image_obs:
+        example_observation = {
+            "state": ds.dataset_dict["observations"]["state"][0][np.newaxis],
+            "image": ds.dataset_dict["observations"]["image"][0][np.newaxis],
+        }
+    else:
+        example_observation = ds.dataset_dict["observations"][0][np.newaxis]
     example_action = ds.dataset_dict["actions"][0][np.newaxis]
-    env = get_robomimic_env(str(dataset_path), example_action, FLAGS.env_name)
-    eval_env = get_robomimic_env(str(dataset_path), example_action, FLAGS.env_name)
+    env = get_robomimic_env(str(dataset_path), example_action, FLAGS.env_name, use_image_obs=FLAGS.use_image_obs)
+    eval_env = get_robomimic_env(str(dataset_path), example_action, FLAGS.env_name, use_image_obs=FLAGS.use_image_obs)
     max_traj_len = ENV_TO_HORIZON_MAP[FLAGS.env_name]
 
     ds.seed(FLAGS.seed)
@@ -152,17 +187,24 @@ def main(_):
     assert model_cls in MODEL_REGISTRY, f"Unsupported model_cls={model_cls!r}. Supported model classes: {sorted(MODEL_REGISTRY)}"
     create_fn = MODEL_REGISTRY[model_cls].create
     create_sig = inspect.signature(create_fn)
+    _squeeze = lambda x: jax.tree_map(lambda v: v.squeeze(), x)
     if "states" in create_sig.parameters and "states" not in kwargs:
         if "states" in ds.dataset_dict:
             state_input = ds.dataset_dict["states"][0][np.newaxis]
         else:
             state_input = example_observation
-        agent = create_fn(FLAGS.seed, example_observation.squeeze(), example_action.squeeze(), state_input.squeeze(), **kwargs)
+        agent = create_fn(FLAGS.seed, _squeeze(example_observation), example_action.squeeze(), _squeeze(state_input), **kwargs)
     else:
-        agent = create_fn(FLAGS.seed, example_observation.squeeze(), example_action.squeeze(), **kwargs)
+        agent = create_fn(FLAGS.seed, _squeeze(example_observation), example_action.squeeze(), **kwargs)
     print_agent_param_summary(agent)
 
-    replay_buffer = RoboReplayBuffer(example_observation.squeeze(), example_action.squeeze(), FLAGS.max_steps)
+    # Warm up the eval path so the first evaluation does not stall on JIT compilation.
+    if FLAGS.use_image_obs:
+        print("[warmup] Compiling eval path (eval_actions)...", flush=True)
+        agent.eval_actions(jax.tree_map(lambda x: jnp.asarray(x.squeeze()), example_observation))
+        print("[warmup] Done.", flush=True)
+
+    replay_buffer = RoboReplayBuffer(_squeeze(example_observation), example_action.squeeze(), FLAGS.max_steps)
     replay_buffer.seed(FLAGS.seed)
 
     train_logger = CsvLogger(os.path.join(log_dir, "train.csv"))
