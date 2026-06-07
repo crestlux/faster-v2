@@ -2,6 +2,7 @@ import functools
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
+from jax.scipy.ndimage import map_coordinates
 from typing import Any, Callable, Sequence, Tuple, Optional
 
 ModuleDef = Any
@@ -28,12 +29,33 @@ class ResNetBlock(nn.Module):
 
         return self.act(residual + y)
 
+def _spatial_softmax(feat: jnp.ndarray) -> jnp.ndarray:
+    """Soft-argmax keypoint pooling (Finn'16 / robomimic / Diffusion Policy).
+
+    feat: (..., H, W, K). Per channel, softmax over the H*W spatial grid then take
+    the expected (x, y) coordinate (normalised to [-1, 1]). Returns (..., 2K) — it
+    preserves WHERE each channel fires (unlike GAP, which averages location away).
+    Leading batch dims are preserved.
+    """
+    H, W, K = feat.shape[-3], feat.shape[-2], feat.shape[-1]
+    lead = feat.shape[:-3]
+    attn = jax.nn.softmax(feat.reshape(lead + (H * W, K)), axis=-2)  # over spatial HW
+    xs = jnp.linspace(-1.0, 1.0, W)
+    ys = jnp.linspace(-1.0, 1.0, H)
+    xx, yy = jnp.meshgrid(xs, ys, indexing="xy")  # (H, W)
+    exp_x = jnp.einsum("...nk,n->...k", attn, xx.reshape(H * W))
+    exp_y = jnp.einsum("...nk,n->...k", attn, yy.reshape(H * W))
+    return jnp.concatenate([exp_x, exp_y], axis=-1)
+
+
 class ResNet(nn.Module):
     stage_sizes: Sequence[int]
     block_cls: ModuleDef
     num_filters: int = 64
     dtype: Any = jnp.float32
     act: Callable = nn.relu
+    pool: str = "gap"   # "gap" (global average pooling) or "spatial_softmax"
+    num_kp: int = 32    # spatial_softmax keypoints; output dim = 2*num_kp
 
     @nn.compact
     def __call__(self, x, training: bool = True):
@@ -50,7 +72,12 @@ class ResNet(nn.Module):
                 strides = (2, 2) if i > 0 and j == 0 else (1, 1)
                 x = self.block_cls(self.num_filters * (2 ** i), strides=strides, conv=conv, norm=norm, act=self.act)(x)
 
-        x = jnp.mean(x, axis=(-3, -2))
+        if self.pool == "spatial_softmax":
+            # 1x1 conv reduces 512 -> num_kp channels, then soft-argmax -> 2*num_kp coords.
+            x = nn.Conv(self.num_kp, (1, 1), dtype=self.dtype, name='kp_conv')(x)
+            x = _spatial_softmax(x)
+        else:
+            x = jnp.mean(x, axis=(-3, -2))
         return x
 
 ResNet18 = functools.partial(ResNet, stage_sizes=[2, 2, 2, 2], block_cls=ResNetBlock)
@@ -61,18 +88,53 @@ ResNet18 = functools.partial(ResNet, stage_sizes=[2, 2, 2, 2], block_cls=ResNetB
 # Applied per sample, per view independently. No-op for non-image observations.
 # ---------------------------------------------------------------------------
 
+def _rotate_image(img: jnp.ndarray, angle_rad: jnp.ndarray) -> jnp.ndarray:
+    """Rotate a (H, W, 3) image about its center by angle_rad (CCW), bilinear.
+
+    Edge pixels are replicated (mode='nearest') so corners stay filled; the
+    subsequent crop trims the small rotated border for typical small angles.
+    """
+    H, W = img.shape[0], img.shape[1]
+    cy = (H - 1) / 2.0
+    cx = (W - 1) / 2.0
+    yy, xx = jnp.meshgrid(jnp.arange(H), jnp.arange(W), indexing="ij")
+    yy = yy.astype(jnp.float32) - cy
+    xx = xx.astype(jnp.float32) - cx
+    cos_a, sin_a = jnp.cos(angle_rad), jnp.sin(angle_rad)
+    # Inverse map: output pixel (y, x) -> source coordinate to sample from.
+    src_y = cos_a * yy + sin_a * xx + cy
+    src_x = -sin_a * yy + cos_a * xx + cx
+    coords = [src_y, src_x]
+    return jax.vmap(
+        lambda ch: map_coordinates(ch, coords, order=1, mode="nearest"),
+        in_axes=-1, out_axes=-1,
+    )(img)
+
+
 def _augment_single_view(key: jnp.ndarray, img: jnp.ndarray, crop_ratio: float = 0.95,
-                          brightness: float = 0.1, contrast: float = 0.1,
-                          saturation: float = 0.1) -> jnp.ndarray:
+                          rotation_deg: float = 0.0, brightness: float = 0.1,
+                          contrast: float = 0.1, saturation: float = 0.1) -> jnp.ndarray:
     """Augment a single (H, W, 3) float32 [0,1] RGB view.
 
+    Order: random small-angle rotation -> random crop+resize -> color jitter.
+    DEFAULTS reproduce the original 5% baseline aug exactly (crop_ratio=0.95,
+    rotation_deg=0 -> rotation is a no-op). Pass crop_ratio=0.9 / rotation_deg>0
+    to enable the aug-ablation arm as a SEPARATE single-variable change.
     Called per-sample per-view via vmap — C is always 3 here.
     """
     H, W = img.shape[0], img.shape[1]
     crop_H = int(H * crop_ratio)
     crop_W = int(W * crop_ratio)
 
-    k_crop, k_b, k_c, k_s = jax.random.split(key, 4)
+    k_rot, k_crop, k_b, k_c, k_s = jax.random.split(key, 5)
+
+    # Random small-angle rotation about the image center (EXPO-FT / paper style).
+    # openpi's public pipeline ships no rotation; this is a standard label-preserving
+    # nuisance aug (action labels unchanged) — corners replicated then trimmed by crop.
+    if rotation_deg > 0:
+        ang = jax.random.uniform(k_rot, (), minval=-rotation_deg, maxval=rotation_deg)
+        img = _rotate_image(img, ang * (jnp.pi / 180.0))
+
     kh, kw = jax.random.split(k_crop)
 
     # Random crop + bilinear resize back to original resolution
@@ -99,8 +161,8 @@ def _augment_single_view(key: jnp.ndarray, img: jnp.ndarray, crop_ratio: float =
 
 
 def augment_obs_batch(rng: jnp.ndarray, obs, crop_ratio: float = 0.95,
-                      brightness: float = 0.1, contrast: float = 0.1,
-                      saturation: float = 0.1):
+                      rotation_deg: float = 0.0, brightness: float = 0.1,
+                      contrast: float = 0.1, saturation: float = 0.1):
     """Apply independent augmentation per sample and per camera view.
 
     obs: dict with "image" key (B, H, W, C) where C must be a multiple of 3, or raw array.
@@ -136,7 +198,7 @@ def augment_obs_batch(rng: jnp.ndarray, obs, crop_ratio: float = 0.95,
     # vmap over (batch, view) — each (key, img_HW3) pair augmented independently
     augmented = jax.vmap(
         jax.vmap(
-            lambda k, img: _augment_single_view(k, img, crop_ratio, brightness, contrast, saturation)
+            lambda k, img: _augment_single_view(k, img, crop_ratio, rotation_deg, brightness, contrast, saturation)
         )
     )(keys, image_views)
     # augmented: (B, n_views, H, W, 3) in [0,1]
@@ -149,6 +211,8 @@ def augment_obs_batch(rng: jnp.ndarray, obs, crop_ratio: float = 0.95,
 class ImageStateEncoder(nn.Module):
     encoder_cls: ModuleDef
     state_proj_dim: int = 0  # >0: project state to this dim before concat (paper: 64)
+    pool: str = "gap"        # vision pooling head: "gap" or "spatial_softmax"
+    num_kp: int = 32         # spatial_softmax keypoints (passed through to the ResNet)
 
     @nn.compact
     def __call__(self, observations, training: bool = False):
@@ -172,7 +236,7 @@ class ImageStateEncoder(nn.Module):
 
             image = (image - mean) / std
 
-            img_embed = self.encoder_cls(name='img_encoder')(image, training=training)
+            img_embed = self.encoder_cls(name='img_encoder', pool=self.pool, num_kp=self.num_kp)(image, training=training)
 
             # Optional state projection to fixed dim (paper: 64-dim proprioception embed)
             if self.state_proj_dim > 0:

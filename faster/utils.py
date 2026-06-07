@@ -6,7 +6,7 @@ import numpy as np
 from robomimic.utils.dataset import SequenceDataset
 
 import wandb
-from faster.data.robomimic_datasets import LOW_DIM_OBS_KEYS, IMAGE_OBS_KEYS, process_robomimic_dataset
+from faster.data.robomimic_datasets import PROPRIOCEPTION_KEYS, LOW_DIM_OBS_KEYS, IMAGE_OBS_KEYS, process_robomimic_dataset
 from faster.evaluation import evaluate_robo
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -143,9 +143,12 @@ def _sample_action(agent, observation):
 
 
 def _load_robomimic_dataset(dataset_path, use_image_obs=False):
-    obs_keys = list(LOW_DIM_OBS_KEYS)
+    # Image mode: load PROPRIOCEPTION_KEYS (respects PROPRIO_VELOCITY toggle, no object) + images.
+    # Low-dim mode: LOW_DIM_OBS_KEYS (base proprio + object). Must match process_robomimic_dataset.
     if use_image_obs:
-        obs_keys.extend(IMAGE_OBS_KEYS)
+        obs_keys = list(PROPRIOCEPTION_KEYS) + list(IMAGE_OBS_KEYS)
+    else:
+        obs_keys = list(LOW_DIM_OBS_KEYS)
         
     seq_dataset = SequenceDataset(
         hdf5_path=str(dataset_path),

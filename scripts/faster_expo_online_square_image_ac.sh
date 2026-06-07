@@ -1,20 +1,16 @@
 #!/usr/bin/env bash
-# ne=8 + utd=8 + blocks=4 + filter512
-#   wandb name: square_ph_image_ac8e4_ne8utd8full_<timestamp>__s42
-#   wandb group: ac8e4_ablation
+# square (NutAssemblySquare, horizon=400) — ACTION CHUNK: chunk_size=8, exec_horizon=4
+#   image + proprioception, FASTER-EXPO (EXPO-FT style chunk critic/edit).
 #
-# 코드 현황 (2026-05-30 수정 반영):
-#   - 보상 버그 수정: make_chunk_dataset가 terminal 청크(reward/done/mask) 유지
-#   - Filter critic: 전체 노이즈(action_dim=56)로 조건화 (exec 28 trim 제거)
-#   - Temperature: unscaled residual 엔트로피 + target=-14 → α가 0으로 붕괴 안 함
-#   - Critic 인코더: 공유 trunk 단일 ResNet18(~11M) + ensemble head, raw obs로 일관 사용
-#                    (이전: 앙상블원마다 인코더 10개 → 추론 시 bypass되던 비일관 제거)
+# 2026-06 수정 반영: 이미지 스케일 fix, eval/rollout이 online actor 사용(critic/filter 학습과 일관),
+#   actor 인코더 LR 노출(1e-4), EXPO-FT augmentation on,
+#   chunk critic backup: 단일 γ (논문 Eq.5, chunk_discount_mode=per_chunk 기본 — 성능 목적).
+#     (ablation으로 per-env-step γ 고정을 원하면 --config.chunk_discount_mode=per_step)
 #
-# 메모리/설정 (shared-encoder critic, 실측):
-#   batch=256 → peak ~6.6GB (이전 10-encoder critic 대비 ~14GB에서 대폭 감소)
-#   _image.sh와 동일 GPU 동시 실행: 각 MEM_FRACTION=0.4(9.6GB) → 합 0.8(19.2GB) < 24GB
-#   utd_ratio=8: 메모리 중립(순차 루프, mini-batch=batch_size). 샘플효율은 utd로 조절
-#   pretrain_steps=10000 / max_steps=150000 유지
+# online step 정렬(사용자 선택): max_steps/eval_interval을 _image.sh(baseline)와 **동일 값**으로 둠.
+#   → 정책 결정 횟수·gradient update 횟수·wandb step축 일치(그래프 직접 overlay).
+#   주의: ac는 결정당 exec_horizon(4) env step 실행 → 동일 max_steps에서 env 상호작용 4배(더 많은 실데이터),
+#   wallclock도 더 김. (sample-efficiency를 env-step 기준으로 보려면 ac max_steps를 ÷4 하면 됨: $@로 조정.)
 export CUDA_VISIBLE_DEVICES=0
 export XLA_PYTHON_CLIENT_PREALLOCATE=true
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.4
@@ -24,21 +20,26 @@ source .env && python train_robo.py \
   --dataset_dir=ph \
   --env_name=square $@ \
   --use_image_obs=True \
-  --batch_size=256 \
+  --batch_size=64 \
   --save_video=True \
-  --utd_ratio=8 \
+  --utd_ratio=20 \
   --checkpoint_model=True \
   --checkpoint_keep=3 \
   --eval_interval=5000 \
   --eval_episodes=20 \
-  --pretrain_steps=10000 \
-  --max_steps=150000 \
+  --offline_eval_interval=10000 \
+  --pretrain_steps=60000 \
+  --max_steps=80000 \
   --chunk_size=8 \
   --exec_horizon=4 \
   --config.ne_samples=8 \
   --config.ne_samples_train=8 \
   --config.actor_num_blocks=4 \
+  --config.actor_encoder_lr=1e-4 \
+  --config.r_action_scale=0.05 \
+  --augment_obs=True \
+  --state_proj_dim=64 \
   "--config.filter_critic_hidden_dims=(512,512,512)" \
   --noshare_encoder \
-  --run_tag=ne8utd8full_b256_fixed \
-  --wandb_run_group=ac8e4_ablation
+  --run_tag=ac8e4_enclr1e4_aug \
+  --wandb_run_group=square_ac8e4_ablation

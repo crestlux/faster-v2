@@ -14,4 +14,4 @@ from faster.networks.diffusion import (
 from faster.networks.ensemble import Ensemble, subsample_ensemble
 from faster.networks.mlp import MLP, default_init
 from faster.networks.mlp_resnet import MLPResNetV2
-from faster.networks.state_action_value import StateActionValue, StateValue, StateActionEncoder
+from faster.networks.state_action_value import StateActionValue, StateValue, StateActionEncoder, SharedEncoderEnsembleCritic

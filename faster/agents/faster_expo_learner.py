@@ -25,6 +25,7 @@ from faster.networks import (
     Ensemble,
     FourierFeatures,
     MLPResNetV2,
+    SharedEncoderEnsembleCritic,
     StateActionValue,
     StateActionEncoder,
     cosine_beta_schedule,
@@ -145,9 +146,14 @@ def _sample_actions_jit(agent, observations):
     observations = jax.tree_map(lambda x: jnp.expand_dims(x, axis=0) if x.ndim == 1 or x.ndim == 3 else x, observations)
 
     # Always compute actor encoding for actor scan efficiency (avoids T×ResNet18 per step).
-    actor_obs_enc = agent._get_obs_encoding(observations, agent.target_actor.params)
+    # Use the ONLINE actor (not target) for action generation: the critic/filter are trained
+    # to score candidates produced by self.actor's denoising (see update/_sample_candidates),
+    # and with actor_tau=0.001 the target actor lags far behind during fine-tuning. Acting with
+    # the target here makes eval/rollout both stale and inconsistent with training -> ~0% success
+    # even when the trained policy works (verified: lift current-actor 60% vs target 0% @1250).
+    actor_obs_enc = agent._get_obs_encoding(observations, agent.actor.params)
 
-    actor_params = agent.target_actor.params
+    actor_params = agent.actor.params
     # obs_for_filter: raw obs needed so actor's denoising scan has the dict for obs_flat;
     #   filter scoring uses actor_obs_enc_rep inside ddim_sampler_hidden_filter (Fix 1).
     # obs_for_critic: the outer critic owns its encoder, so it gets the RAW obs and encodes
@@ -157,7 +163,7 @@ def _sample_actions_jit(agent, observations):
     obs_for_critic = actor_obs_enc if agent.share_encoder else observations
 
     if agent.filter_enabled and agent.filter_at_eval:
-        actions, _, rng = agent._sample_candidates(rng, obs_for_filter, agent.N, actor_params, agent.filter_temperature_train, actor_obs_enc=actor_obs_enc)
+        actions, _, rng = agent._sample_candidates(rng, obs_for_filter, agent.N, actor_params, agent.filter_temperature_train, actor_obs_enc=actor_obs_enc, k_keep=min(agent.n_base_deploy, agent.N))
     else:
         actions, rng = ddim_sampler(
             agent.actor.apply_fn,
@@ -195,15 +201,17 @@ def _sample_actions_jit(agent, observations):
             d_exec = edit_base[:, : agent.critic_action_dim]  # (ne, exec_dim)
             # Use actor_obs_enc: consistent with update_edit_actor training path.
             # StateActionEncoder handles (1, enc_dim) → repeats to match (ne, enc_dim).
+            # EXPO/EXPO-FT: edits are STOCHASTIC samples (one per base candidate); the top-Q argmax
+            # below selects among the 8 base + 8 edit candidates (a* = argmax_a Q). The critic must
+            # be calibrated over edited actions (it is, online: Eq.5 backs up from a*).
             r_exec, rng = _sample_actions(key, agent.edit_actor.apply_fn, agent.edit_actor.params, actor_obs_enc, d_exec)
             r_exec = agent._apply_residual_action_mask(r_exec * agent.r_action_scale) + d_exec
             r_exec = jnp.clip(r_exec, -1.0, 1.0)
             r_full = jnp.concatenate([r_exec, edit_base[:, agent.critic_action_dim :]], axis=-1)
             all_actions = jnp.concatenate([all_actions, r_full], axis=0)  # (N+ne, action_dim)
 
-        # EXPO-FT: Q evaluates executed portion only: Q(s, a_{t:t+C})
+        # EXPO-FT: Q evaluates executed portion only: Q(s, a_{t:t+C}); deterministic top-Q selection.
         exec_all = all_actions[:, : agent.critic_action_dim]  # (N+ne, critic_action_dim)
-        # StateActionValue repeats obs internally to match exec_all batch size
         qs = compute_q(agent.target_critic.apply_fn, target_params, obs_for_critic, exec_all)
         idx = jnp.argmax(qs)
         action = all_actions[idx]  # return full action_dim for ActionChunkWrapper
@@ -221,14 +229,24 @@ def _eval_actions_jit(agent, observations):
     observations = jax.tree_map(lambda x: jnp.squeeze(x), observations)
     observations = jax.tree_map(lambda x: jnp.expand_dims(x, axis=0) if x.ndim == 1 or x.ndim == 3 else x, observations)
 
-    actor_obs_enc = agent._get_obs_encoding(observations, agent.target_actor.params)
-    actor_params = agent.target_actor.params
+    # Use the ONLINE actor (not target) for action generation: the critic/filter are trained
+    # to score candidates produced by self.actor's denoising (see update/_sample_candidates),
+    # and with actor_tau=0.001 the target actor lags far behind during fine-tuning. Acting with
+    # the target here makes eval/rollout both stale and inconsistent with training -> ~0% success
+    # even when the trained policy works (verified: lift current-actor 60% vs target 0% @1250).
+    import os as _os
+    # HYPOTHESIS TEST: official uses target_actor (EMA, stable) for eval/deploy candidates;
+    # our fork switched to live self.actor (image-encoder-lag motivated, but harmful for low-dim
+    # where there's no encoder -> noisy oscillating eval). EVAL_USE_TARGET_ACTOR=1 reverts to official.
+    _eval_params = agent.target_actor.params if _os.environ.get("EVAL_USE_TARGET_ACTOR") == "1" else agent.actor.params
+    actor_obs_enc = agent._get_obs_encoding(observations, _eval_params)
+    actor_params = _eval_params
     obs_for_filter = actor_obs_enc if agent.share_encoder else observations
     # Critic owns its encoder → raw obs when share_encoder=False; flat features only when True.
     obs_for_critic = actor_obs_enc if agent.share_encoder else observations
 
     if agent.filter_enabled and agent.filter_at_eval:
-        actions, _, rng = agent._sample_candidates(rng, obs_for_filter, agent.N, actor_params, agent.filter_temperature_eval, actor_obs_enc=actor_obs_enc)
+        actions, _, rng = agent._sample_candidates(rng, obs_for_filter, agent.N, actor_params, agent.filter_temperature_eval, actor_obs_enc=actor_obs_enc, k_keep=min(agent.n_base_deploy, agent.N))
     else:
         actions, rng = ddim_sampler(
             agent.actor.apply_fn, actor_params, agent.T, rng, agent.action_dim,
@@ -252,7 +270,7 @@ def _eval_actions_jit(agent, observations):
                 tile_factor = (agent.ne_samples + n_base - 1) // n_base
                 edit_base = jnp.tile(diffusion_actions, (tile_factor, 1))[: agent.ne_samples]
             d_exec = edit_base[:, : agent.critic_action_dim]
-            # Use actor_obs_enc: consistent with update_edit_actor training path.
+            # EXPO/EXPO-FT: stochastic edit samples (one per base candidate); top-Q argmax selects.
             r_exec, rng = _sample_actions(key, agent.edit_actor.apply_fn, agent.edit_actor.params, actor_obs_enc, d_exec)
             r_exec = agent._apply_residual_action_mask(r_exec * agent.r_action_scale) + d_exec
             r_exec = jnp.clip(r_exec, -1.0, 1.0)
@@ -361,37 +379,7 @@ class DenoisingStateActionValue(nn.Module):
         return jnp.squeeze(value, -1)
 
 
-class SharedEncoderEnsembleCritic(nn.Module):
-    """One shared image encoder (TD-trained) feeding an ensemble of Q heads.
-
-    Replaces ``Ensemble(StateActionValue(obs_encoder_cls=...))``, which gave every one of the
-    ``num_qs`` members its OWN ResNet18 (~10x compute/memory) that was then bypassed at inference
-    (the critic was fed actor-encoded features there, and 7/8 of UTD updates). The result was a
-    train/inference representation mismatch and a critic encoder that was trained but never used.
-
-    Here a SINGLE encoder owns the visual representation, receives the TD gradient, and is used
-    consistently at training, inference, and Bellman-target time.
-
-    - ``observations`` is a dict with "image": the encoder runs (gradient flows to it).
-    - ``observations`` is a flat array (already encoded, e.g. ``share_encoder=True``): the inner
-      ``ImageStateEncoder`` passes it through unchanged, so the heads operate on those features
-      and no encoder params are created — preserving the share_encoder=True behaviour.
-
-    The encoder is named ``ImageStateEncoder_0`` (matched by the split-LR optimizer and the
-    pretrained-weight copy) and the heads live under ``Ensemble_0`` (matched by
-    ``subsample_ensemble``, which leaves the shared encoder intact).
-    """
-    encoder_cls: type
-    net_cls: type
-    num_qs: int
-
-    @nn.compact
-    def __call__(self, observations, actions, *args):
-        feat = self.encoder_cls()(observations)  # GroupNorm encoder: training flag is a no-op
-        return Ensemble(self.net_cls, num=self.num_qs)(feat, actions, *args)
-
-
-@partial(jax.jit, static_argnames=("actor_apply_fn", "hidden_apply_fn", "act_dim", "filter_act_dim", "T", "N", "training", "filter_temperature_mode"))
+@partial(jax.jit, static_argnames=("actor_apply_fn", "hidden_apply_fn", "act_dim", "filter_act_dim", "T", "N", "training", "filter_temperature_mode", "k_keep"))
 def ddim_sampler_hidden_filter(
     actor_apply_fn,
     actor_params,
@@ -413,6 +401,7 @@ def ddim_sampler_hidden_filter(
     init_noise=None,
     filter_act_dim: int = None,
     actor_obs_enc=None,  # pre-computed actor encoding (batch, enc_dim); avoids T×ResNet18 in scan
+    k_keep: int = 1,     # # noise candidates the filter keeps to fully denoise (FASTER=1; EXPO-FT deploy=N_base)
 ):
     batch_size = jax.tree_util.tree_leaves(observations)[0].shape[0]
     obs = jax.tree_map(lambda x: jnp.broadcast_to(x[:, None, ...], (batch_size, N, *x.shape[1:])), observations)
@@ -451,7 +440,9 @@ def ddim_sampler_hidden_filter(
         def select_idx(key_, scores_, k_):
             return sample_k_indices(key_, scores_, k_, temperature=temp, mode=filter_temperature_mode)
 
-        k_keep = 1
+        # FASTER keeps the single best-scored noise (k_keep=1) to fully denoise; EXPO-FT deploy keeps
+        # N_base candidates so the top-Q selection ranks multiple base chunks (paper: 8 base + 8 edit).
+        k_keep = min(int(k_keep), N)
         idx = select_idx(key, q_sel, k_keep)
         x = _gather_axis1(x, idx)
         obs = _gather_axis1(obs, idx)
@@ -574,6 +565,7 @@ class FasterEXPOLearner(Agent):
     filter_temperature_train: float = struct.field(pytree_node=False)
     filter_temperature_eval: float = struct.field(pytree_node=False)
     filter_temperature_mode: str = struct.field(pytree_node=False)
+    chunk_discount_mode: str = struct.field(pytree_node=False)  # "per_chunk" (paper γ¹) | "per_step" (γ^exec_horizon)
 
     action_dim: int = struct.field(pytree_node=False)       # full chunk dim = chunk_size * orig
     orig_action_dim: int = struct.field(pytree_node=False)  # per-step dim (e.g. 7 for robomimic)
@@ -599,7 +591,10 @@ class FasterEXPOLearner(Agent):
     filter_num_min_qs: Optional[int] = struct.field(pytree_node=False)
     share_encoder: bool = struct.field(pytree_node=False)
     state_proj_dim: int = struct.field(pytree_node=False)
+    vision_pool: str = struct.field(pytree_node=False)
+    num_kp: int = struct.field(pytree_node=False)
     augment: bool = struct.field(pytree_node=False)
+    n_base_deploy: int = struct.field(pytree_node=False)
 
     def _get_obs_encoding(self, observations, actor_params):
         """Encode observations using the actor's image encoder with configured state_proj_dim."""
@@ -607,7 +602,7 @@ class FasterEXPOLearner(Agent):
             return observations
         if "ImageStateEncoder_0" not in actor_params:
             return observations
-        return ImageStateEncoder(encoder_cls=get_resnet18, state_proj_dim=self.state_proj_dim).apply(
+        return ImageStateEncoder(encoder_cls=get_resnet18, state_proj_dim=self.state_proj_dim, pool=self.vision_pool, num_kp=self.num_kp).apply(
             {"params": actor_params["ImageStateEncoder_0"]},
             observations,
             training=False,
@@ -630,7 +625,7 @@ class FasterEXPOLearner(Agent):
         chunk_size = total // n_chunks
         obs_chunks = jax.tree_map(lambda x: x.reshape(n_chunks, chunk_size, *x.shape[1:]), observations)
         enc_chunks = jax.lax.map(
-            lambda obs_chunk: ImageStateEncoder(encoder_cls=get_resnet18, state_proj_dim=self.state_proj_dim).apply(
+            lambda obs_chunk: ImageStateEncoder(encoder_cls=get_resnet18, state_proj_dim=self.state_proj_dim, pool=self.vision_pool, num_kp=self.num_kp).apply(
                 {"params": encoder_params}, obs_chunk, training=False
             ),
             obs_chunks,
@@ -646,6 +641,8 @@ class FasterEXPOLearner(Agent):
         actor_lr: float = 3e-4,
         critic_lr: float = 3e-4,
         temp_lr: float = 3e-4,
+        actor_encoder_lr: float = 1e-5,   # image encoder LR for the actor (split from the MLP heads).
+        critic_encoder_lr: float = 1e-4,  # image encoder LR for the critic (warm-started from actor enc).
         hidden_dims: Sequence[int] = (256, 256),
         critic_hidden_dims: Optional[Sequence[int]] = None,
         outer_critic_hidden_dims: Optional[Sequence[int]] = None,
@@ -687,9 +684,13 @@ class FasterEXPOLearner(Agent):
         filter_temperature_train: Optional[float] = None,
         filter_temperature_eval: Optional[float] = None,
         filter_temperature_mode: str = "plain",
+        chunk_discount_mode: str = "per_chunk",
         share_encoder: bool = False,
         state_proj_dim: int = 0,
+        vision_pool: str = "gap",
+        num_kp: int = 32,
         augment: bool = False,
+        n_base_deploy: int = 8,
     ):
         action_dim = action_space.shape[-1]
         chunk_size = int(chunk_size)
@@ -718,6 +719,7 @@ class FasterEXPOLearner(Agent):
 
         assert target_num_qs >= 2, target_num_qs
         _validate_sampling_mode(filter_temperature_mode)
+        assert chunk_discount_mode in ("per_chunk", "per_step"), chunk_discount_mode
 
         if isinstance(action_space, gym.Space):
             observations = observation_space.sample()
@@ -754,7 +756,7 @@ class FasterEXPOLearner(Agent):
         )
         # Encoder factory: consistent state_proj_dim across actor and all critic/filter networks.
         from functools import partial as _partial
-        enc_factory = _partial(ImageStateEncoder, encoder_cls=get_resnet18, state_proj_dim=state_proj_dim)
+        enc_factory = _partial(ImageStateEncoder, encoder_cls=get_resnet18, state_proj_dim=state_proj_dim, pool=vision_pool, num_kp=num_kp)
 
         actor_def = DDPM(time_preprocess_cls=preprocess_time_cls, cond_encoder_cls=cond_model_cls,
                          reverse_encoder_cls=base_model_cls, obs_encoder_cls=enc_factory)
@@ -767,7 +769,7 @@ class FasterEXPOLearner(Agent):
         if _is_image:
             _in_ch = int(jnp.asarray(observations["image"]).shape[-1])
             actor_params = _load_pretrained_resnet18_conv_weights(actor_params, _in_ch)
-            actor_tx = _make_split_encoder_tx(actor_params, optax.adamw(learning_rate=actor_lr))
+            actor_tx = _make_split_encoder_tx(actor_params, optax.adamw(learning_rate=actor_lr), encoder_lr=actor_encoder_lr)
         else:
             actor_tx = optax.adamw(learning_rate=actor_lr)
         actor = TrainState.create(apply_fn=actor_def.apply, params=actor_params, tx=actor_tx)
@@ -802,10 +804,22 @@ class FasterEXPOLearner(Agent):
         # Input conditioning: executed chunk (critic_action_dim), not full prediction.
         edit_actor_def = TanhNormal(edit_actor_base_cls, critic_action_dim)
         edit_actor_init_actions = jnp.ones((1, critic_action_dim))
-        edit_actor_params = edit_actor_def.init(actor_key, observations, edit_actor_init_actions)["params"]
+        # The edit_actor is ALWAYS fed actor-encoded flat features (state_proj_dim-respecting),
+        # never a raw obs dict — at both training (update_edit_actor) and candidate selection.
+        # So initialise it on that same flat encoding. Initialising on the raw dict instead would
+        # encode via a default ImageStateEncoder with state_proj_dim=0, mismatching the inference
+        # encoding whenever state_proj_dim>0 (Dense shape error). This also drops the vestigial
+        # ResNet18 the edit_actor would otherwise carry (it never uses it) — same as the filter critic.
+        if _is_image and "ImageStateEncoder_0" in actor_params:
+            edit_actor_example_obs = ImageStateEncoder(
+                encoder_cls=get_resnet18, state_proj_dim=state_proj_dim, pool=vision_pool, num_kp=num_kp
+            ).apply({"params": actor_params["ImageStateEncoder_0"]}, observations, training=False)
+        else:
+            edit_actor_example_obs = example_obs_enc
+        edit_actor_params = edit_actor_def.init(actor_key, edit_actor_example_obs, edit_actor_init_actions)["params"]
         if _is_image:
             edit_actor_params = _load_pretrained_resnet18_conv_weights(edit_actor_params, _in_ch)
-            edit_actor_tx = _make_split_encoder_tx(edit_actor_params, optax.adam(learning_rate=actor_lr))
+            edit_actor_tx = _make_split_encoder_tx(edit_actor_params, optax.adam(learning_rate=actor_lr), encoder_lr=actor_encoder_lr)
         else:
             edit_actor_tx = optax.adam(learning_rate=actor_lr)
         edit_actor = TrainState.create(apply_fn=edit_actor_def.apply, params=edit_actor_params, tx=edit_actor_tx)
@@ -823,10 +837,8 @@ class FasterEXPOLearner(Agent):
             )
 
         def make_outer_critic_cls(critic_hidden_dims_):
-            # Heads take pre-encoded flat features (obs_encoder_cls=None); the single shared
-            # encoder lives in SharedEncoderEnsembleCritic, outside the ensemble vmap.
-            return partial(StateActionValue, base_cls=make_critic_base_cls(critic_hidden_dims_),
-                           obs_encoder_cls=None)
+            # Heads receive pre-encoded flat features from SharedEncoderEnsembleCritic's single encoder.
+            return partial(StateActionValue, base_cls=make_critic_base_cls(critic_hidden_dims_))
 
         def make_filter_critic_cls(critic_hidden_dims_):
             return partial(
@@ -856,7 +868,7 @@ class FasterEXPOLearner(Agent):
             base_tx = optax.adam(learning_rate=critic_lr)
         # Split-LR optimizer: the shared encoder (ImageStateEncoder_0) learns at 1e-4 (slower than
         # the MLP heads at critic_lr), preserving pretrained features while adapting to the TD signal.
-        tx = _make_split_encoder_tx(critic_params, base_tx, encoder_lr=1e-4) if _is_image and not share_encoder else base_tx
+        tx = _make_split_encoder_tx(critic_params, base_tx, encoder_lr=critic_encoder_lr) if _is_image and not share_encoder else base_tx
         critic = TrainState.create(apply_fn=critic_def.apply, params=critic_params, tx=tx)
         target_critic_def = SharedEncoderEnsembleCritic(encoder_cls=enc_factory, net_cls=outer_critic_cls, num_qs=target_num_qs)
         target_critic = TrainState.create(
@@ -897,7 +909,7 @@ class FasterEXPOLearner(Agent):
             # (not a dict → else branch), so no img_encoder sub-module is created in params.
             if _is_image and "ImageStateEncoder_0" in actor_params:
                 filter_example_obs = ImageStateEncoder(
-                    encoder_cls=get_resnet18, state_proj_dim=state_proj_dim
+                    encoder_cls=get_resnet18, state_proj_dim=state_proj_dim, pool=vision_pool, num_kp=num_kp
                 ).apply({"params": actor_params["ImageStateEncoder_0"]}, observations, training=False)
             else:
                 filter_example_obs = example_obs_enc
@@ -947,17 +959,22 @@ class FasterEXPOLearner(Agent):
             filter_temperature_train=htemp_train,
             filter_temperature_eval=htemp_eval,
             filter_temperature_mode=filter_temperature_mode,
+            chunk_discount_mode=chunk_discount_mode,
             share_encoder=bool(share_encoder),
             state_proj_dim=int(state_proj_dim),
+            vision_pool=str(vision_pool),
+            num_kp=int(num_kp),
             augment=bool(augment),
+            n_base_deploy=int(n_base_deploy),
         )
 
-    def _sample_candidates(self, rng, observations, N, actor_params, filter_temperature, actor_obs_enc=None):
-        """Sample N action candidates.
+    def _sample_candidates(self, rng, observations, N, actor_params, filter_temperature, actor_obs_enc=None, k_keep=1):
+        """Sample N action candidates; the filter keeps the best k_keep to fully denoise.
 
         observations: raw obs dict when share_encoder=False; flat encoded when True.
         actor_obs_enc: pre-computed actor encoding (batch, enc_dim) for the denoising scan.
             Avoids T×ResNet18 per step when share_encoder=False. Pass None when not needed.
+        k_keep: # base candidates kept after filtering (FASTER training=1; EXPO-FT deploy=N_base).
         """
         observations = jax.tree_map(lambda x: jax.device_put(jnp.asarray(x)), observations)
         batch_size = jax.tree_util.tree_leaves(observations)[0].shape[0]
@@ -1013,21 +1030,19 @@ class FasterEXPOLearner(Agent):
             init_noise=None,
             filter_act_dim=None,  # condition filter on the full noise vector (action_dim)
             actor_obs_enc=actor_obs_enc,
+            k_keep=k_keep,
         )
         return actions, stored, rng
 
     def _outer_backup_q_scores(self, target_params, observations, actions):
+        # EXPO-FT / RedQ: take the MINIMUM over the subsampled target heads (num_min_qs, e.g. 2)
+        # and use it for BOTH candidate selection and the Bellman backup — matching the paper's
+        # "draw 2 networks at random ... take their minimum to reduce overestimation".
+        # (Previously used a decorrelated select(head0)/eval(head1) split — a double-Q variant that
+        #  also controls selection bias — but it deviated from the paper's literal min-of-2.)
         q_values_sel = self.target_critic.apply_fn({"params": target_params}, observations, actions)
-        q_sel_values = q_values_sel[0::2]
-        q_eval_values = q_values_sel[1::2]
-        if q_sel_values.shape[0] == 0:
-            q_sel_values = q_values_sel
-        if q_eval_values.shape[0] == 0:
-            q_eval_values = q_values_sel
-
-        q_sel = q_sel_values.min(axis=0)
-        q_eval = q_eval_values.min(axis=0)
-        return q_sel, q_eval
+        q = q_values_sel.min(axis=0)
+        return q, q
 
     def _apply_residual_action_mask(self, residual_actions):
         if self.residual_action_mask is None:
@@ -1203,11 +1218,26 @@ class FasterEXPOLearner(Agent):
         next_actions, next_q, _, rng = self._select_best_actions(
             rng, edit_filter_next, critic_next_obs, next_actions_candidates, target_params
         )
-        # γ^exec_horizon per chunk: normalises to γ=0.99 per env-step across all chunk_size ablations.
-        # Paper (2605.25477) uses γ^1 per chunk (single-system, not an ablation), but that creates
-        # a 20x difference in terminal-reward weighting between exec=1 and exec=4 on sparse-reward
-        # tasks — confounding chunk_size comparisons. γ^exec_horizon eliminates this confound.
-        target_q = batch["rewards"] + (self.discount ** self.exec_horizon) * batch["masks"] * next_q
+        # Chunk Bellman backup. `batch["rewards"]` is the (undiscounted) sum of rewards over the
+        # executed window — matching the online ActionChunkWrapper (offline↔online consistency;
+        # intra-chunk discounting is negligible for robomimic's sparse success reward).
+        #
+        # Two modes (chunk_discount_mode), differing only in the bootstrap discount:
+        #   "per_chunk" (DEFAULT, PAPER-FAITHFUL): Q(s_t,a_{t:t+C}) = r_t + γ · Q(s_{t+C}, ã*)
+        #       This is the EXPO-FT paper's LITERAL update (Sec 4.2 Eq.5) — a BARE γ (verified
+        #       verbatim: no γ^C anywhere in the chunk Bellman; r_t is the sparse binary success
+        #       reward). Formally it treats the chunk as one macro-step (a chunk-MDP). NOTE the
+        #       paper is internally inconsistent: its Sec-3 objective E[Σ γ^t r_t] is per-env-step
+        #       (which would call for γ^C), but the actual update uses bare γ — we follow the update.
+        #   "per_step":  Q = r_t + γ^exec_horizon · Q(s_{t+C}, ã*)
+        #       The exact n-step backup for the per-env-step objective (options/semi-MDP), γ=0.99 per
+        #       env-step fixed across chunk sizes. Use only for a controlled chunk_size *ablation*.
+        #       At exec_horizon=1 both modes coincide (γ^1 = γ).
+        if self.chunk_discount_mode == "per_chunk":
+            chunk_discount = self.discount
+        else:  # "per_step"
+            chunk_discount = self.discount ** self.exec_horizon
+        target_q = batch["rewards"] + chunk_discount * batch["masks"] * next_q
 
         key, rng = jax.random.split(rng)
 
@@ -1389,88 +1419,7 @@ class FasterEXPOLearner(Agent):
             new_agent, temp_info = new_agent.update_temperature(edit_info["entropy"])
             actor_info.update(edit_info)
             actor_info.update(temp_info)
-        filter_noise_info = {}
-        return new_agent, {**actor_info, **critic_info, **filter_noise_info}
-
-    @partial(jax.jit, static_argnames="utd_ratio")
-    def update_separate(self, batch: DatasetDict, actor_batch: DatasetDict, utd_ratio: int):
-        assert utd_ratio > 0
-        assert jax.tree_util.tree_leaves(batch["observations"])[0].shape[0] % utd_ratio == 0
-        mini_batch_size = jax.tree_util.tree_leaves(batch["observations"])[0].shape[0] // utd_ratio
-
-        rng = self.rng
-        if self.augment:
-            rng, obs_key, next_key = jax.random.split(rng, 3)
-            batch = {**batch,
-                     "observations": augment_obs_batch(obs_key, batch["observations"]),
-                     "next_observations": augment_obs_batch(next_key, batch["next_observations"])}
-
-        n_enc_chunks = max(1, utd_ratio // 4)
-
-        obs_enc = jax.lax.stop_gradient(self._get_obs_encoding_chunked(batch["observations"], self.target_actor.params, n_enc_chunks))
-        next_obs_enc = jax.lax.stop_gradient(self._get_obs_encoding_chunked(batch["next_observations"], self.target_actor.params, n_enc_chunks))
-        # Outer-critic obs: RAW (share_encoder=False) so its own encoder runs; flat only when shared.
-        critic_batch = batch if not self.share_encoder else {**batch, "observations": obs_enc, "next_observations": next_obs_enc}
-
-        if self.share_encoder:
-            next_obs_for_cands = next_obs_enc
-            actor_obs_enc_for_cands = None
-        else:
-            next_obs_for_cands = batch["next_observations"]
-            actor_obs_enc_for_cands = next_obs_enc
-
-        def get_mini_batch(i):
-            start = i * mini_batch_size
-            return jax.tree_util.tree_map(lambda x: jax.lax.dynamic_slice_in_dim(x, start, mini_batch_size, axis=0), critic_batch)
-
-        def get_actor_enc_next(i):
-            start = i * mini_batch_size
-            return jax.lax.dynamic_slice_in_dim(next_obs_enc, start, mini_batch_size, axis=0)
-
-        raw_edit_batch = jax.tree_util.tree_map(
-            lambda x: jax.lax.dynamic_slice_in_dim(x, (utd_ratio - 1) * mini_batch_size, mini_batch_size, axis=0), batch
-        )
-
-        # rng continues from augmentation split (no reset to self.rng)
-        next_cands_full, stored_full, rng = self._sample_candidates(
-            rng, next_obs_for_cands, self.train_N, self.actor.params, self.filter_temperature_train,
-            actor_obs_enc=actor_obs_enc_for_cands,
-        )
-        new_agent = self.replace(rng=rng)
-
-        def get_mini_candidates(i):
-            start = i * mini_batch_size
-            cands = jax.lax.dynamic_slice_in_dim(next_cands_full, start, mini_batch_size, axis=0)
-            stored = tuple(jax.lax.dynamic_slice_in_dim(s, start, mini_batch_size, axis=0) for s in stored_full)
-            return cands, stored
-
-        def body(i, carry):
-            agent, _ = carry
-            cands, stored = get_mini_candidates(i)
-            agent, info = agent.update_critic_from_candidates(
-                get_mini_batch(i), cands, stored, agent.rng, actor_enc_next=get_actor_enc_next(i)
-            )
-            return agent, info
-
-        cands0, stored0 = get_mini_candidates(0)
-        new_agent, critic_info = new_agent.update_critic_from_candidates(
-            get_mini_batch(0), cands0, stored0, new_agent.rng, actor_enc_next=get_actor_enc_next(0)
-        )
-        new_agent, critic_info = jax.lax.fori_loop(1, utd_ratio, body, (new_agent, critic_info))
-
-        new_agent, actor_info = new_agent.update_actor(actor_batch)
-        if self.ne_samples + self.ne_samples_train > 0:
-            edit_obs_enc_slice = jax.lax.dynamic_slice_in_dim(
-                obs_enc, (utd_ratio - 1) * mini_batch_size, mini_batch_size, axis=0
-            )
-            new_agent, edit_info = new_agent.update_edit_actor(
-                raw_edit_batch, edit_obs_enc_slice, has_critic_obs_enc=True
-            )
-            new_agent, temp_info = new_agent.update_temperature(edit_info["entropy"])
-            actor_info.update(edit_info)
-            actor_info.update(temp_info)
-        filter_noise_info = {}
-        return new_agent, {**actor_info, **critic_info, **filter_noise_info}
+        return new_agent, {**actor_info, **critic_info}
 
     @partial(jax.jit, static_argnames="utd_ratio")
     def update(self, batch: DatasetDict, utd_ratio: int):
@@ -1556,8 +1505,7 @@ class FasterEXPOLearner(Agent):
             new_agent, temp_info = new_agent.update_temperature(edit_info["entropy"])
             actor_info.update(edit_info)
             actor_info.update(temp_info)
-        filter_noise_info = {}
-        return new_agent, {**actor_info, **critic_info, **filter_noise_info}
+        return new_agent, {**actor_info, **critic_info}
 
 
 def get_config():
@@ -1606,6 +1554,16 @@ def get_config():
     config.filter_temperature_train = 1.0
     config.filter_temperature_eval = 0.0
     config.filter_temperature_mode = "zscore"
+    # Chunk Bellman discount. DEFAULT "per_chunk" matches the EXPO-FT paper's literal update
+    # (Sec 4.2 Eq.5): Q(s_t,a_{t:t+C}) = r_t + γ·Q(s_{t+C}, ...) — a BARE γ (no exponent), with r_t
+    # the sparse binary success reward (undiscounted). Verified verbatim: γ has no exponent anywhere
+    # in the chunk Bellman; only the Sec-3 objective uses γ^t. (The paper is internally a bit
+    # inconsistent — its Sec-3 objective E[Σ γ^t r_t] is per-env-step, which would imply γ^C — but
+    # the actual chunk update uses bare γ, so per_chunk is the paper-faithful choice.)
+    # "per_step" = γ^exec_horizon bootstrap: the exact n-step backup for the per-env-step objective
+    # (options/semi-MDP), fixed across chunk sizes — use only for a controlled chunk_size ablation.
+    # Identical at exec_horizon=1. See CHANGES_FROM_OFFICIAL.md §3.5.
+    config.chunk_discount_mode = "per_chunk"
 
     config.ne_samples = 1
     config.ne_samples_train = 1
@@ -1617,12 +1575,36 @@ def get_config():
     config.actor_drop = 0.0
     config.d_actor_drop = 0.0
     config.actor_lr = 3e-4
+    # Image-encoder learning rates, split from the MLP heads (optax.multi_transform).
+    # Default 1e-5 keeps the warm-started ImageNet encoder nearly frozen — adequate for easy
+    # tasks (lift/can) but too slow for tasks needing precise visual localization (square,
+    # tool_hang). Raise actor_encoder_lr (e.g. 1e-4) to let the encoder adapt to robosuite
+    # pixels; verified to drop BC actor_loss from ~0.25 (frozen) to ~0.16 on square.
+    config.actor_encoder_lr = 1e-5
+    config.critic_encoder_lr = 1e-4
     config.actor_layer_norm = True
-    config.actor_tau = 0.001
+    # Polyak rate for target_actor. After the online-actor eval fix, target_actor is used ONLY as a
+    # stable encoder snapshot for training-time candidate/edit obs encoding (eval/rollout use the
+    # live self.actor). With actor_encoder_lr raised to 1e-4 the encoder moves faster, so 0.001
+    # (EMA window ~1000 steps) lagged too far behind the live encoder. 0.005 (window ~200, = critic
+    # tau) tracks it closely → smaller train/eval encoder gap, negligible added bootstrap variance
+    # (the actor is BC-only and target_critic already stabilizes the value target).
+    config.actor_tau = 0.005
     config.actor_num_blocks = 4
     config.decay_steps = int(3e6)
     config.share_encoder = False
     config.state_proj_dim = 0
+    # Vision pooling head for the image ResNet encoder. "gap" reproduces the 5% baseline;
+    # "spatial_softmax" replaces global avg pooling with soft-argmax keypoints (Arm A).
+    config.vision_pool = "gap"
+    config.num_kp = 32
     config.augment = False
+    # EXPO-FT deploy candidate pool: at eval/rollout the filter keeps N_base base chunks (paper: 8)
+    # for the top-Q selection, instead of FASTER's single best (k_keep=1). With ne_samples stochastic
+    # edits this realises the paper's "N base + N edit → deterministic top-Q" (Eq.2: a* = argmax_a Q).
+    # If N (noise pool) > n_base_deploy the filter prunes N→n_base_deploy (FASTER efficiency); if equal
+    # it keeps all. Under-representing the base (the old k_keep=1) made a flat/uncalibrated critic pick
+    # noisy edits → deploy collapse; 8 base candidates keep the deploy robust. Training keeps k_keep=1.
+    config.n_base_deploy = 8
 
     return config

@@ -27,7 +27,12 @@ from faster.networks import (
     StateValue,
     cosine_beta_schedule,
     ddim_sampler,
+    SharedEncoderEnsembleCritic,
     vp_beta_schedule,
+)
+from faster.agents.faster_expo_learner import (
+    _make_split_encoder_tx,
+    _copy_actor_enc_to_ensemble_params,
 )
 
 
@@ -266,6 +271,7 @@ class FasterIDQLLearner(Agent):
         expectile=0.8,
         actor_lr: float = 3e-4,
         critic_lr: float = 3e-4,
+        critic_encoder_lr: float = 1e-4,
         temp_lr: float = 3e-4,
         hidden_dims: Sequence[int] = (256, 256, 256),
         discount: float = 0.99,
@@ -360,7 +366,9 @@ class FasterIDQLLearner(Agent):
         elif share_encoder:
             example_obs_enc = observations
         else:
-            example_obs_enc = observations  # raw obs → each network initializes its own encoder
+            example_obs_enc = observations  # raw obs → SharedEncoderEnsembleCritic builds its own encoder
+
+        _is_image = isinstance(observations, dict) and "image" in observations
 
         if beta_schedule == "cosine":
             betas = jnp.array(cosine_beta_schedule(T))
@@ -385,21 +393,18 @@ class FasterIDQLLearner(Agent):
                 use_layer_norm=critic_layer_norm,
                 use_pnorm=use_pnorm,
             )
-        # Pass enc_factory as obs_encoder_cls so each network uses the configured encoder.
-        # When share_encoder=True, example_obs_enc is flat → enc_factory is a no-op inside networks.
-        # When share_encoder=False, example_obs_enc is raw dict → each network builds own encoder.
-        critic_cls = partial(StateActionValue, base_cls=critic_base_cls, obs_encoder_cls=enc_factory)
-        critic_def = Ensemble(critic_cls, num=num_qs)
+        outer_critic_cls = partial(StateActionValue, base_cls=critic_base_cls)
+        critic_def = SharedEncoderEnsembleCritic(encoder_cls=enc_factory, net_cls=outer_critic_cls, num_qs=num_qs)
         critic_params = critic_def.init(critic_key, example_obs_enc, actions)["params"]
+        if _is_image and not share_encoder and "ImageStateEncoder_0" in actor_params:
+            critic_params = _copy_actor_enc_to_ensemble_params(critic_params, actor_params["ImageStateEncoder_0"])
         if critic_weight_decay is not None:
-            critic_tx = optax.adamw(learning_rate=critic_lr, weight_decay=critic_weight_decay, mask=decay_mask_fn)
+            base_tx = optax.adamw(learning_rate=critic_lr, weight_decay=critic_weight_decay, mask=decay_mask_fn)
         else:
-            critic_tx = optax.adam(learning_rate=critic_lr)
+            base_tx = optax.adam(learning_rate=critic_lr)
+        critic_tx = _make_split_encoder_tx(critic_params, base_tx, encoder_lr=critic_encoder_lr) if _is_image and not share_encoder else base_tx
         critic = TrainState.create(apply_fn=critic_def.apply, params=critic_params, tx=critic_tx)
-        # target_critic: apply_fn sized for num_min_qs (after subsample), params hold full num_qs
-        # for EMA consistency with critic. subsample_ensemble is called in update_value to select
-        # num_min_qs heads before applying.
-        target_critic_def = Ensemble(critic_cls, num=num_min_qs or num_qs)
+        target_critic_def = SharedEncoderEnsembleCritic(encoder_cls=enc_factory, net_cls=outer_critic_cls, num_qs=num_min_qs or num_qs)
         target_critic = TrainState.create(
             apply_fn=target_critic_def.apply, params=critic_params, tx=optax.GradientTransformation(lambda _: None, lambda _: None)
         )

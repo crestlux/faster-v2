@@ -97,6 +97,9 @@ flags.DEFINE_boolean("share_encoder", False, "Share actor image encoder with cri
                      "False (default) gives each network its own encoder trained via TD gradient (paper design).")
 flags.DEFINE_integer("state_proj_dim", 0, "Project proprioception to this dim before concat with image features. "
                      "0 = no projection (default). 64 matches the paper's design.")
+flags.DEFINE_string("vision_pool", "gap", "Vision pooling head for the image ResNet: 'gap' (global avg pool, "
+                    "baseline) or 'spatial_softmax' (soft-argmax keypoints, Arm A).")
+flags.DEFINE_integer("num_kp", 32, "spatial_softmax keypoints; encoder image-feature dim = 2*num_kp.")
 flags.DEFINE_boolean("augment_obs", False, "Apply random crop+resize+color jitter during training (paper style). "
                      "No-op for low-dim obs. Default False.")
 config_flags.DEFINE_config_file(
@@ -205,6 +208,10 @@ def main(_):
         FLAGS.config.share_encoder = FLAGS.share_encoder
     if "state_proj_dim" in FLAGS.config:
         FLAGS.config.state_proj_dim = FLAGS.state_proj_dim
+    if "vision_pool" in FLAGS.config:
+        FLAGS.config.vision_pool = FLAGS.vision_pool
+    if "num_kp" in FLAGS.config:
+        FLAGS.config.num_kp = FLAGS.num_kp
     if "augment" in FLAGS.config:
         FLAGS.config.augment = FLAGS.augment_obs
 
@@ -301,6 +308,24 @@ def main(_):
             for k, v in eval_info.items():
                 wandb.log({f"offline-evaluation/{k}": v}, step=i)
                 eval_logger.log({"event": "offline-evaluation", "metric": k, "value": v}, step=i)
+
+            # Checkpoint during offline pretrain too (named with an "offline_" prefix so it
+            # never collides with the online-phase checkpoint_{i}). Enables post-hoc analysis
+            # of the pretrained policy at multiple stages (e.g. selection-mode ablations).
+            if FLAGS.checkpoint_model:
+                try:
+                    import flax
+                    ckpt_path = os.path.join(chkpt_dir, f"checkpoint_offline_{i}.msgpack")
+                    with open(ckpt_path, "wb") as f:
+                        f.write(flax.serialization.to_bytes(agent))
+                    import glob
+                    off_ckpts = sorted(glob.glob(os.path.join(chkpt_dir, "checkpoint_offline_*.msgpack")), key=os.path.getmtime)
+                    while len(off_ckpts) > FLAGS.checkpoint_keep:
+                        os.remove(off_ckpts.pop(0))
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    print(f"Could not save offline checkpoint: {e}")
 
     _start_step = FLAGS.resume_step if FLAGS.resume_from else 0
 

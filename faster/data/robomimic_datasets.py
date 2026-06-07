@@ -1,3 +1,4 @@
+import os
 from copy import deepcopy
 
 import numpy as np
@@ -8,9 +9,17 @@ from robomimic.config import config_factory
 
 from faster.data.dataset import Dataset
 
-# For low_dim, we use "object" state. For images, we use vision + proprioception only
-PROPRIOCEPTION_KEYS = ("robot0_eef_pos", "robot0_eef_quat", "robot0_gripper_qpos")
-LOW_DIM_OBS_KEYS = PROPRIOCEPTION_KEYS + ("object",)
+# For low_dim, we use "object" state. For images, we use vision + proprioception only.
+# Image-mode proprio is a clean ablation axis: PROPRIO_VELOCITY=1 appends single-step
+# velocities (eef lin/ang + gripper qvel) -> state 9->17. The privileged "object" state is
+# NEVER added to the image-mode proprio (only to low-dim LOW_DIM_OBS_KEYS, base keys only).
+_BASE_PROPRIO_KEYS = ("robot0_eef_pos", "robot0_eef_quat", "robot0_gripper_qpos")
+PROPRIOCEPTION_KEYS = _BASE_PROPRIO_KEYS
+if os.environ.get("PROPRIO_VELOCITY", "0") == "1":
+    PROPRIOCEPTION_KEYS = _BASE_PROPRIO_KEYS + (
+        "robot0_eef_vel_lin", "robot0_eef_vel_ang", "robot0_gripper_qvel",
+    )
+LOW_DIM_OBS_KEYS = _BASE_PROPRIO_KEYS + ("object",)
 IMAGE_OBS_KEYS = ("agentview_image", "robot0_eye_in_hand_image")
 ENV_TO_HORIZON_MAP = {"lift": 400, "can": 400, "square": 400, "transport": 700, "tool_hang": 700}
 
@@ -101,9 +110,17 @@ class RobosuiteGymWrapper:
                     img = img.transpose(1, 2, 0)
                 images.append(img)
             image = np.concatenate(images, axis=-1)
-            return {"state": state, "image": image}
+            # robomimic creates the env with postprocess_visual_obs=True, so it returns images
+            # already normalized to float [0,1] (CHW). The offline dataset, replay buffer and
+            # ImageStateEncoder all use the [0,255] convention (the encoder divides by 255).
+            # Without this rescale the encoder divides the env's [0,1] image by 255 again, feeding
+            # the policy near-black images at eval / online action-selection -> 0% success.
+            if np.issubdtype(image.dtype, np.floating):
+                image = np.clip(image * 255.0, 0.0, 255.0).astype(np.uint8)
+            # Env proprioception is float64; the dataset/replay-buffer convention is float32.
+            return {"state": state.astype(np.float32), "image": image}
         else:
-            return np.concatenate([obs[key] for key in self.obs_keys], axis=-1)
+            return np.concatenate([obs[key] for key in self.obs_keys], axis=-1).astype(np.float32)
 
 
 def process_robomimic_dataset(seq_dataset, use_image_obs=False):
